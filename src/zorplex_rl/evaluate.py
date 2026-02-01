@@ -87,10 +87,8 @@ def generate_with_tools(
 
     turns: list[Turn] = []
     all_text = ""
-    print(f"===DEBUG=== messages: {messages}")
 
     for turn_idx in range(max_turns):
-        print(f"===DEBUG=== Starting turn {turn_idx}")
         # Build prompt from conversation so far
         text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
@@ -110,7 +108,6 @@ def generate_with_tools(
 
         # Generate until tool call or max tokens
         with torch.no_grad():
-            print(f"===DEBUG=== on turn {turn_idx}, using text {text}")
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=max_tokens_per_turn,
@@ -126,11 +123,9 @@ def generate_with_tools(
             outputs[0][prompt_length:],
             skip_special_tokens=True
         )
-        print(f"===DEBUG=== new_text: {new_text}")
 
         # Find tool calls in the new text
         tool_calls = spec.parse_tool_calls(new_text)
-        print(f"===DEBUG=== tool_calls: {tool_calls}")
 
         if not tool_calls:
             # No tool calls - we're done
@@ -163,7 +158,6 @@ def generate_with_tools(
         result_injection = "\n[Result: " + ", ".join(tool_results) + "]\n"
         all_text += new_text + result_injection
 
-    print(f"===DEBUG=== all_text: {all_text}")
     # Extract final answer from all generated text
     extracted = spec.extract_answer(all_text, [tc for t in turns for tc in t.tool_calls])
     is_correct = extracted == task.correct_answer
