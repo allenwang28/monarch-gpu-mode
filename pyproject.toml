@@ -11,6 +11,8 @@ dependencies = [
     "torchmonarch>=0.3.0",
     "vllm>=0.6.0",
     "accelerate",
+    "matplotlib>=3.10.8",
+    "scipy>=1.15.3",
 ]
 
 [project.optional-dependencies]
