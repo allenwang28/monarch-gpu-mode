@@ -197,12 +197,19 @@ def _(mo):
 
 
 @app.cell
-def _(TASK_SPECS, device, generate_with_tools, get_spec, model, tokenizer):
+def _(TASK_SPECS, device, generate_with_tools, get_spec, model, tokenizer, torch):
     import time
+    import random
 
     # Run benchmark on all tasks
     NUM_SAMPLES = 10
     SEED = 42
+
+    # Set seeds for reproducibility
+    random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
 
     benchmark_results = {}
     all_latencies = []  # Track latencies across all tasks
@@ -245,30 +252,24 @@ def _(TASK_SPECS, device, generate_with_tools, get_spec, model, tokenizer):
         }
 
     # Print summary table
-    print("=" * 80)
+    print("=" * 60)
     print("ZORPLEX BENCHMARK RESULTS")
-    print("=" * 80)
-    print(f"{'Task':<15} {'Description':<25} {'Accuracy':>10} {'Latency (ms)':>20}")
-    print(f"{'':<15} {'':<25} {'':>10} {'avg':>8} {'min':>6} {'max':>6}")
-    print("-" * 80)
+    print("=" * 60)
+    print(f"{'Task':<15} {'Description':<25} {'Accuracy':>12}")
+    print("-" * 60)
 
     for bench_task_name, _data in benchmark_results.items():
         print(
             f"{bench_task_name:<15} "
             f"{_data['description']:<25} "
-            f"{_data['correct']:>3}/{_data['total']:<3} ({_data['accuracy']*100:>3.0f}%) "
-            f"{_data['avg_latency_ms']:>6.0f} "
-            f"{_data['min_latency_ms']:>6.0f} "
-            f"{_data['max_latency_ms']:>6.0f}"
+            f"{_data['correct']:>3}/{_data['total']:<3} ({_data['accuracy']*100:>3.0f}%)"
         )
 
-    print("-" * 80)
+    print("-" * 60)
     total_correct = sum(d["correct"] for d in benchmark_results.values())
     total_samples = sum(d["total"] for d in benchmark_results.values())
-    all_lats_ = [l["latency_ms"] for l in all_latencies]
-    print(f"{'OVERALL':<15} {'':<25} {total_correct:>3}/{total_samples:<3} ({total_correct/total_samples*100:>3.0f}%) "
-          f"{sum(all_lats_)/len(all_lats_):>6.0f} {min(all_lats_):>6.0f} {max(all_lats_):>6.0f}")
-    print("=" * 80)
+    print(f"{'OVERALL':<15} {'':<25} {total_correct:>3}/{total_samples:<3} ({total_correct/total_samples*100:>3.0f}%)")
+    print("=" * 60)
     return all_latencies, benchmark_results
 
 
@@ -636,7 +637,9 @@ def _(mo):
     mo.md(r"""
     ## Interactive Visualization: Sync vs Async
 
-    Adjust the parameters to see how generation variance affects sync vs async RL:
+    Adjust the parameters to see how generation variance affects sync vs async RL.
+
+    **Note:** We assume batch size = number of generators (one trajectory per generator per batch).
     """)
     return
 
@@ -647,21 +650,23 @@ def _(mo):
     mean_gen_time = mo.ui.slider(100, 500, value=200, label="Mean generation time (ms)")
     variance = mo.ui.slider(0.1, 2.0, value=0.8, step=0.1, label="Variance (coefficient of variation)")
     train_time = mo.ui.slider(50, 300, value=100, label="Training time (ms)")
+    weight_sync_time = mo.ui.slider(10, 100, value=30, label="Weight sync time (ms)")
     num_batches = mo.ui.slider(2, 5, value=3, label="Batches to simulate")
 
-    mo.vstack([num_generators, mean_gen_time, variance, train_time, num_batches])
-    return mean_gen_time, num_batches, num_generators, train_time, variance
+    mo.vstack([num_generators, mean_gen_time, variance, train_time, weight_sync_time, num_batches])
+    return mean_gen_time, num_batches, num_generators, train_time, variance, weight_sync_time
 
 
 @app.cell
-def _(mean_gen_time, mo, num_batches, num_generators, train_time, variance):
-    def make_interactive_comparison(n_gens_val, mean_val, var_val, train_val, n_batch_val):
+def _(mean_gen_time, mo, num_batches, num_generators, train_time, variance, weight_sync_time):
+    def make_interactive_comparison(n_gens_val, mean_val, var_val, train_val, sync_val, n_batch_val):
         import random
         import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
         import math
 
-        random.seed(42)  # Reproducible for same slider values
+        # Seed based on slider values so different configs give different samples
+        random.seed(42 + int(mean_val) + int(var_val * 100) + n_gens_val + n_batch_val)
 
         # Sample generation times from log-normal distribution
         def sample_gen_times(mean, cv, n):
@@ -693,7 +698,9 @@ def _(mean_gen_time, mo, num_batches, num_generators, train_time, variance):
 
             train_start = sync_time + max_time
             sync_bars.append((n_gens_val, train_start, train_val, "crimson"))
-            sync_time = train_start + train_val
+            # Weight sync after training
+            sync_bars.append((n_gens_val + 1, train_start + train_val, sync_val, "#9467bd"))
+            sync_time = train_start + train_val + sync_val
 
         total_sync_time = sync_time
 
@@ -712,14 +719,16 @@ def _(mean_gen_time, mo, num_batches, num_generators, train_time, variance):
         train_batch = 0
         while t < total_gen_time:
             async_bars.append((n_gens_val, t, train_val, "crimson"))
+            # Weight sync happens in parallel / pipelined (overlapped with next train)
+            async_bars.append((n_gens_val + 1, t, sync_val, "#9467bd"))
             t += train_val
             train_batch += 1
 
         total_async_time = max(total_gen_time, t)
 
         # ===== PLOTTING =====
-        fig, axes = plt.subplots(1, 2, figsize=(14, 4 + n_gens_val * 0.3))
-        row_labels = [f"Gen {i+1}" for i in range(n_gens_val)] + ["Trainer"]
+        fig, axes = plt.subplots(1, 2, figsize=(14, 4.5 + n_gens_val * 0.3))
+        row_labels = [f"Gen {i+1}" for i in range(n_gens_val)] + ["Trainer", "Wt Sync"]
 
         for ax, bars, title, total_time in [
             (axes[0], sync_bars, "Sync RL", total_sync_time),
@@ -738,6 +747,7 @@ def _(mean_gen_time, mo, num_batches, num_generators, train_time, variance):
         # Legend
         patches = [mpatches.Patch(color=batch_colors[i], label=f"Batch {i+1}") for i in range(n_batch_val)]
         patches.append(mpatches.Patch(color="crimson", label="Train"))
+        patches.append(mpatches.Patch(color="#9467bd", label="Wt Sync"))
         axes[1].legend(handles=patches, loc="upper right", fontsize=8)
 
         plt.tight_layout()
@@ -750,7 +760,8 @@ def _(mean_gen_time, mo, num_batches, num_generators, train_time, variance):
         return fig, total_sync_time, total_async_time, sync_util, async_util
 
     fig, total_sync, total_async, sync_util, async_util = make_interactive_comparison(
-        num_generators.value, mean_gen_time.value, variance.value, train_time.value, num_batches.value
+        num_generators.value, mean_gen_time.value, variance.value,
+        train_time.value, weight_sync_time.value, num_batches.value
     )
 
     mo.vstack([
