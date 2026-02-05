@@ -17,7 +17,15 @@ def _():
     import torch
     from monarch.actor import Actor, endpoint, this_host, current_rank
     from monarch.rdma import RDMABuffer, is_rdma_available
-    return Actor, RDMABuffer, endpoint, is_rdma_available, this_host, time, torch
+    return (
+        Actor,
+        RDMABuffer,
+        current_rank,
+        endpoint,
+        is_rdma_available,
+        this_host,
+        torch,
+    )
 
 
 @app.cell
@@ -199,11 +207,12 @@ def _(mo):
 
     **Key observations:**
 
-    1. **NVLink dominates** - 450 GB/s unidirectional is ~9x faster than a single NIC
-    2. **Multi-NIC scales** - 8 NICs × 50 GB/s = 400 GB/s, approaching NVLink speeds
+    1. **NVLink is fast but same-node only** - 450 GB/s, but can't cross the network
+    2. **RDMA >> TCP** - 50 GB/s with zero-copy beats TCP significantly for cross-node
+    3. **Multi-NIC scales** - 8 NICs × 50 GB/s = 400 GB/s, approaching NVLink speeds
 
-    **Rule of thumb**: Keep frequent operations on NVLink (gradients, activations).
-    Use RDMA for cross-node communication (weight sync).
+    **Rule of thumb**: NVLink for same-node ops (gradients, activations).
+    RDMA for cross-node communication (weight sync) - it's the only practical option.
 
     ### Back-of-Envelope: Syncing Large Models
 
@@ -467,60 +476,60 @@ def _(Actor, RDMABuffer, endpoint, is_rdma_available, this_host, torch):
         if not is_rdma_available():
             show_fallback_demo()
         else:
-            class SimpleTrainer(Actor):
-                """Trainer that holds weights and exposes an RDMA handle."""
+            class Sender(Actor):
+                """Sender that holds data and exposes an RDMA handle."""
 
-                def __init__(self, weight_size: int):
-                    # Simulate model weights
-                    self.weights = torch.randn(weight_size, dtype=torch.float32)
+                def __init__(self, size: int):
+                    # Create some data to send
+                    self.data = torch.randn(size, dtype=torch.float32)
                     # Register with RDMA
-                    self.weight_bytes = self.weights.view(torch.uint8).flatten()
-                    self.buffer = RDMABuffer(self.weight_bytes)
-                    print(f"[Trainer] Created weights: {self.weights.numel() * 4 / 1e6:.1f} MB")
+                    self.data_bytes = self.data.view(torch.uint8).flatten()
+                    self.buffer = RDMABuffer(self.data_bytes)
+                    print(f"[Sender] Created data: {self.data.numel() * 4 / 1e6:.1f} MB")
 
                 @endpoint
-                def get_weight_handle(self) -> RDMABuffer:
-                    """Return tiny handle (not the weights themselves!)"""
+                def get_handle(self) -> RDMABuffer:
+                    """Return tiny handle (not the data itself!)"""
                     return self.buffer
 
                 @endpoint
                 def get_checksum(self) -> float:
-                    """For verification: sum of weights"""
-                    return float(self.weights.sum())
+                    """For verification: sum of data"""
+                    return float(self.data.sum())
 
-            class SimpleGenerator(Actor):
-                """Generator that pulls weights from trainer."""
+            class Receiver(Actor):
+                """Receiver that pulls data from sender via RDMA."""
 
-                def __init__(self, weight_size: int):
-                    # Pre-allocate space for weights
-                    self.weights = torch.zeros(weight_size, dtype=torch.float32)
-                    self.weight_bytes = self.weights.view(torch.uint8).flatten()
-                    print(f"[Generator] Allocated buffer: {self.weights.numel() * 4 / 1e6:.1f} MB")
+                def __init__(self, size: int):
+                    # Pre-allocate space for data
+                    self.data = torch.zeros(size, dtype=torch.float32)
+                    self.data_bytes = self.data.view(torch.uint8).flatten()
+                    print(f"[Receiver] Allocated buffer: {self.data.numel() * 4 / 1e6:.1f} MB")
 
                 @endpoint
-                def pull_weights(self, handle: RDMABuffer) -> float:
-                    """Pull weights via RDMA read, return checksum for verification."""
+                def pull_data(self, handle: RDMABuffer) -> float:
+                    """Pull data via RDMA read, return checksum for verification."""
                     # This is the magic: RDMA read directly into our buffer
-                    handle.read_into(self.weight_bytes).get()
-                    return float(self.weights.sum())
+                    handle.read_into(self.data_bytes).get()
+                    return float(self.data.sum())
 
-            # Spawn trainer and generator
-            _procs = this_host().spawn_procs(per_host={"procs": 2})
+            # Spawn sender and receiver
+            procs = this_host().spawn_procs(per_host={"procs": 2})
 
-            _trainer = _procs.slice(procs=0).spawn("trainer", SimpleTrainer, 1024 * 1024)  # 4 MB
-            _generator = _procs.slice(procs=1).spawn("generator", SimpleGenerator, 1024 * 1024)
+            sender = procs.slice(procs=0).spawn("sender", Sender, 1024 * 1024)  # 4 MB
+            receiver = procs.slice(procs=1).spawn("receiver", Receiver, 1024 * 1024)
 
-            # Step 1: Get handle from trainer (tiny message!)
-            _handle = _trainer.get_weight_handle.call_one().get()
-            print(f"\n[Orchestrator] Got handle from trainer")
+            # Step 1: Get handle from sender (tiny message!)
+            handle = sender.get_handle.call_one().get()
+            print(f"\n[Orchestrator] Got handle from sender")
 
-            # Step 2: Send handle to generator, have it pull weights
-            _gen_checksum = _generator.pull_weights.call_one(_handle).get()
-            _trainer_checksum = _trainer.get_checksum.call_one().get()
+            # Step 2: Send handle to receiver, have it pull data
+            receiver_checksum = receiver.pull_data.call_one(handle).get()
+            sender_checksum = sender.get_checksum.call_one().get()
 
-            print(f"[Orchestrator] Trainer checksum: {_trainer_checksum:.2f}")
-            print(f"[Orchestrator] Generator checksum: {_gen_checksum:.2f}")
-            print(f"[Orchestrator] Match: {abs(_trainer_checksum - _gen_checksum) < 0.01}")
+            print(f"[Orchestrator] Sender checksum: {sender_checksum:.2f}")
+            print(f"[Orchestrator] Receiver checksum: {receiver_checksum:.2f}")
+            print(f"[Orchestrator] Match: {abs(sender_checksum - receiver_checksum) < 0.01}")
 
     except Exception as e:
         print(f"(Demo failed: {e})\n")
@@ -716,19 +725,26 @@ def _(mo):
 
     Let's see this in action! We'll simulate the core async RL pattern:
 
-    - **Trainer loop**: Runs training steps, publishes new weights to a 3-slot circular buffer
-    - **Generator loop**: Periodically syncs to latest weights, then generates
+    - **1 Trainer**: Runs training steps, publishes new weights to a 3-slot circular buffer
+    - **4 Generators**: Each independently syncs to latest weights, then generates
 
-    Both loops run **concurrently and independently**. The trainer never waits for generators,
-    and generators grab weights whenever they're ready. To verify correctness, we'll set
-    each weight tensor to `torch.ones(size) * version` - the generator can then check that
-    it received the right data.
+    All 5 actors run **concurrently and independently**. The trainer never waits for generators,
+    and each generator grabs weights whenever it's ready (at slightly different rates to show
+    the async behavior). To verify correctness, we set weights to `version` and check on read.
     """)
     return
 
 
 @app.cell
-def _(Actor, RDMABuffer, endpoint, is_rdma_available, this_host, time, torch):
+def _(
+    Actor,
+    RDMABuffer,
+    current_rank,
+    endpoint,
+    is_rdma_available,
+    this_host,
+    torch,
+):
 
     def show_fallback():
         print("(RDMA not available - showing conceptual flow)\n")
@@ -742,10 +758,10 @@ def _(Actor, RDMABuffer, endpoint, is_rdma_available, this_host, time, torch):
             show_fallback()
         else:
             class Trainer(Actor):
-                """Trainer with 3-slot circular buffer."""
+                """Trainer with circular buffer for weight versioning."""
 
                 def __init__(self, weight_size: int):
-                    self.n_slots = 3
+                    self.n_slots = 5
                     self.version = 0
                     self.slots = []
                     self.handles = []
@@ -756,23 +772,28 @@ def _(Actor, RDMABuffer, endpoint, is_rdma_available, this_host, time, torch):
                     print(f"[Trainer] Initialized {self.n_slots}-slot circular buffer")
 
                 @endpoint
-                def get_latest(self) -> tuple:
+                async def get_latest(self) -> tuple:
                     if self.version == 0:
                         return None, -1
                     v = self.version - 1
                     return self.handles[v % self.n_slots], v
 
                 @endpoint
-                def run_loop(self, n_steps: int, step_time: float):
+                async def run_loop(self, n_steps: int, step_time: float):
                     """Train loop: step → publish → repeat."""
-                    for _ in range(n_steps):
-                        time.sleep(step_time)  # Simulate train step
+                    import sys
+                    import asyncio
 
-                        # Publish: set weights = version (for verification)
+                    for step in range(n_steps):
+                        # Wait (simulating training work)
+                        await asyncio.sleep(step_time)
+
+                        # Publish new weights
                         slot_idx = self.version % self.n_slots
                         self.slots[slot_idx].fill_(float(self.version))
                         self.version += 1
-                        print(f"[Trainer] Step done, published v{self.version - 1} to slot {slot_idx}")
+                        print(f"[Trainer] Published v{self.version - 1}")
+                        sys.stdout.flush()
 
                     return self.version
 
@@ -780,51 +801,74 @@ def _(Actor, RDMABuffer, endpoint, is_rdma_available, this_host, time, torch):
                 """Generator that syncs weights and generates."""
 
                 def __init__(self, weight_size: int, trainer):
+                    self.gen_id = current_rank().rank  # Get ID from mesh position
                     self.trainer = trainer
                     self.weights = torch.zeros(weight_size, dtype=torch.float32)
                     self.weight_bytes = self.weights.view(torch.uint8).flatten()
                     self.current_version = -1
-                    print(f"[Generator] Initialized, waiting for weights...")
+                    print(f"[Gen {self.gen_id}] Initialized")
 
                 @endpoint
-                def run_loop(self, n_iters: int, gen_time: float):
+                async def run_loop(self, n_iters: int, gen_time: float):
                     """Generate loop: sync weights → generate → repeat."""
-                    for _ in range(n_iters):
-                        # Sync weights if newer available
-                        handle, version = self.trainer.get_latest.call_one().get()
+                    import sys
+                    import asyncio
+
+                    generations = 0
+                    while generations < n_iters:
+                        # Step 1: Try to sync weights
+                        handle, version = await self.trainer.get_latest.call_one()
                         if handle is not None and version > self.current_version:
-                            handle.read_into(self.weight_bytes).get()
+                            await handle.read_into(self.weight_bytes)
 
-                            # Verify: all weights should equal version
+                            # The actual version in the buffer (trainer may have advanced)
                             actual = int(self.weights[0].item())
-                            assert actual == version, f"Mismatch! Got {actual}, expected {version}"
+                            # Accept if we got this version or newer (async means trainer may have updated)
+                            if actual >= version:
+                                self.current_version = actual
+                                print(f"[Gen {self.gen_id}] Synced to v{actual} ✓")
+                            else:
+                                # Stale read (slot was overwritten) - skip, will retry
+                                print(f"[Gen {self.gen_id}] Stale read, retrying...")
+                            sys.stdout.flush()
 
-                            self.current_version = version
-                            print(f"[Generator] Synced to v{version} ✓ (verified)")
-
-                        time.sleep(gen_time)  # Simulate generation
-                        print(f"[Generator] Generated output (using v{self.current_version})")
+                        # Step 2: Generate (only if we have weights)
+                        if self.current_version >= 0:
+                            await asyncio.sleep(gen_time)  # Simulate generation
+                            print(f"[Gen {self.gen_id}] Generated (v{self.current_version})")
+                            sys.stdout.flush()
+                            generations += 1
+                        else:
+                            # No weights yet, just wait a bit and try again
+                            await asyncio.sleep(0.05)
 
                     return self.current_version
 
-            # Spawn actors
-            _procs = this_host().spawn_procs(per_host={"procs": 2})
-            _trainer = _procs.slice(procs=0).spawn("trainer", Trainer, 1000)
-            _generator = _procs.slice(procs=1).spawn("gen", Generator, 1000, _trainer)
+            # Spawn trainer and generators as separate meshes
+            n_generators = 4
+            trainer_proc = this_host().spawn_procs(per_host={"procs": 1})
+            generator_procs = this_host().spawn_procs(per_host={"procs": n_generators})
 
-            print("\n--- Running async RL simulation (~2 seconds) ---\n")
+            trainer = trainer_proc.spawn("trainer", Trainer, weight_size=1024)
+            generators = generator_procs.spawn("generators", Generator, weight_size=1024, trainer=trainer)
 
-            # Run both loops concurrently
-            _trainer_future = _trainer.run_loop.call_one(6, 0.25)  # 6 train steps
-            _gen_future = _generator.run_loop.call_one(5, 0.35)    # 5 generate iters
+            print("\n--- Running async RL simulation ---\n")
 
-            # Wait for both to complete
-            _final_version = _trainer_future.get()
-            _final_gen_version = _gen_future.get()
+            # Start generators FIRST (they'll wait for weights)
+            # This helps with timing - generators are ready when trainer starts publishing
+            gen_future = generators.run_loop.call(5, gen_time=0.25)  # 5 generations, 0.25s each
 
-            print(f"\n--- Done! Trainer published {_final_version} versions, "
-                  f"generator ended on v{_final_gen_version} ---")
-            print("→ Both ran independently, weights verified via RDMA!")
+            # Then start trainer (slower steps to allow interleaving)
+            trainer_future = trainer.run_loop.call_one(6, step_time=1.)  # 6 train steps, 0.8s each
+
+            # Wait for all to complete
+            final_version = trainer_future.get()
+            gen_results = gen_future.get()
+            final_gen_versions = [v for _, v in gen_results.items()]
+
+            print(f"\n--- Done! Trainer published {final_version} versions ---")
+            print(f"→ Generators ended on versions: {final_gen_versions}")
+            print("→ All pulled independently via RDMA, weights verified!")
 
     except Exception as e:
         print(f"(Demo failed: {e})")
