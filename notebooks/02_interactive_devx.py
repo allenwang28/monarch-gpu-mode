@@ -13,23 +13,15 @@ def _():
 @app.cell
 def _():
     # Shared imports for the notebook
-    import sys
     import torch
     from monarch.actor import Actor, endpoint, current_rank, this_host
-    return Actor, current_rank, endpoint, sys, this_host, torch
+    return Actor, current_rank, endpoint, this_host, torch
 
 
 @app.cell
 def _(mo):
     mo.md(r"""
     # Interactive DevX: Monarch as Remote Torchrun
-
-    What you'll learn:
-
-    1. The pain of traditional distributed development (sbatch → wait → debug → repeat)
-    2. SPMDJob as "remote torchrun" - allocate once, iterate fast
-    3. The three-layer stack: Boot → Coordination → Application
-    4. Running distributed programs interactively with `this_host()`
     """)
     return
 
@@ -106,45 +98,12 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## What's Really Happening Under the Hood
+    **What you'll learn:**
 
-    When you call `SlurmJob(meshes={"trainers": 4}).apply()`, here's what actually happens:
-
-    ```
-    1. Job Submission: Monarch submits an sbatch script to SLURM
-       ┌────────────────────────────────────────────────────────────┐
-       │  #!/bin/bash                                               │
-       │  #SBATCH --nodes=4                                         │
-       │  srun python -c 'from monarch.actor import                 │
-       │       run_worker_loop_forever;                             │
-       │       run_worker_loop_forever(                             │
-       │           address="tcp://$(hostname):22222",               │
-       │           ca="trust_all_connections")'                     │
-       └────────────────────────────────────────────────────────────┘
-
-    2. Worker Startup: Each node runs run_worker_loop_forever
-       ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
-       │  Node 0  │  │  Node 1  │  │  Node 2  │  │  Node 3  │
-       │  :22222  │  │  :22222  │  │  :22222  │  │  :22222  │
-       │ waiting  │  │ waiting  │  │ waiting  │  │ waiting  │
-       └──────────┘  └──────────┘  └──────────┘  └──────────┘
-
-    3. Client Connection: job.state() calls attach_to_workers(...)
-       ┌─────────────────────────────────────────────────────────┐
-       │  Your notebook / script                                 │
-       │                                                         │
-       │  host_mesh = attach_to_workers(                         │
-       │      workers=["tcp://node0:22222", "tcp://node1:22222", │
-       │               "tcp://node2:22222", "tcp://node3:22222"],│
-       │      ca="trust_all_connections"                         │
-       │  )                                                      │
-       └─────────────────────────────────────────────────────────┘
-    ```
-
-    **The key insight: Workers are just servers waiting for work.**
-
-    The scheduler (SLURM, Kubernetes, etc.) handles launching them.
-    The client (your notebook/script) connects and orchestrates.
+    1. The pain of traditional distributed development (sbatch, wait, debug, repeat)
+    2. `this_host()` for local development, Monarch's `Job` for real clusters
+    3. Mesh operations: `.call()`, `.slice()`, `.call_one()`
+    4. How logs and errors are aggregated back to your controller
     """)
     return
 
@@ -152,110 +111,15 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ### Live Demo: Workers as Servers
+    ## Your First Interactive Session
 
-    Let's see this in action. We'll use `create_local_host_mesh` which spawns
-    worker processes locally - exactly what SlurmJob does on a real cluster.
-    """)
-    return
+    For local development, `this_host()` gives you a host that can spawn multiple
+    processes. On a real cluster, you'd use something like `SlurmJob` to allocate hosts — but the
+    pattern is identical.
 
-
-@app.cell
-def _(Actor, current_rank, endpoint, sys):
-    from monarch._src.actor.host_mesh import create_local_host_mesh
-    from monarch._src.actor.endpoint import Extent
-
-    class BootstrapDemo(Actor):
-        """Actor that reports where it's running."""
-
-        def __init__(self):
-            self.rank = current_rank().rank
-            print(f"[BootstrapDemo] Actor initialized on rank {self.rank}")
-
-        @endpoint
-        def whoami(self) -> dict:
-            return {"rank": self.rank, "python": sys.executable}
-
-    # This simulates what SlurmJob does:
-    # 1. Spawn worker processes (like run_worker_loop_forever on each node)
-    # 2. Connect to them (like attach_to_workers)
-    # 3. Return a HostMesh
-    print("Creating host mesh with 3 workers...")
-    demo_host_mesh = create_local_host_mesh(
-        extent=Extent(["hosts"], [3]),
-        env={"PYTHONPATH": ":".join(sys.path)},
-    )
-    print("Host mesh created - workers are now listening!\n")
-
-    # Spawn processes and actors
-    demo_procs = demo_host_mesh.spawn_procs(per_host={"gpus": 1})
-    demo_actors = demo_procs.spawn("bootstrap_demo", BootstrapDemo)
-
-    # Call all actors
-    print("\nCalling whoami() on all actors:")
-    demo_results = demo_actors.whoami.call().get()
-    for point, info in demo_results.items():
-        print(f"  {point}: rank={info['rank']}")
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## The Three-Layer Stack
-
-    ```
-    ┌─────────────────────────────────────────────────────┐
-    │               APPLICATION LAYER                     │
-    │   ActorMesh[T] - Your training code as typed actors │
-    │   Example: trainer.train.call(batch).get()          │
-    ├─────────────────────────────────────────────────────┤
-    │              COORDINATION LAYER                     │
-    │   ProcMesh - Manages process lifecycle, ranks       │
-    │   HostMesh - Manages host lifecycle, resources      │
-    │   Example: host_mesh.spawn_procs(name="run_1")      │
-    ├─────────────────────────────────────────────────────┤
-    │               BOOT LAYER                            │
-    │   Bootstrap - Config serialization via env vars     │
-    │   Channel - Async message transport (hyperactor)    │
-    │   Safety: pdeathsig ensures no orphaned processes   │
-    └─────────────────────────────────────────────────────┘
-    ```
-
-    **Code pattern:**
-
-    ```python
-    from monarch.job import SlurmJob
-
-    # Coordination layer - allocate hosts (slow, once)
-    job = SlurmJob(meshes={"workers": 4}, gpus_per_node=8)
-    job.apply()
-    host_mesh = job.state().workers
-
-    # Spawn processes (fast)
-    proc_mesh = host_mesh.spawn_procs(per_host={"gpus": 8})
-
-    # Application layer
-    trainers = proc_mesh.spawn("trainer", TrainerActor)      # Instant
-    trainers.train.call(dataset).get()                       # Your code
-
-    # Iterate without re-allocating - spawn new procs on same hosts
-    proc_mesh_2 = host_mesh.spawn_procs(per_host={"gpus": 8})  # Fast!
-    ```
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## The Simple API: `this_host()`
-
-    The bootstrap demo above used internal APIs to show the mechanics.
-    For actual development, Monarch provides a simpler interface: `this_host()`.
-
-    This gives you a local host that can spawn multiple processes - same pattern,
-    cleaner API. This is how we'll run all our examples in this presentation.
+    *Note: `"gpus"` in `per_host={"gpus": N}` is a dimension label for the mesh —
+    it doesn't require physical GPUs. You can run these examples on a CPU-only
+    machine.*
     """)
     return
 
@@ -271,7 +135,6 @@ def _(Actor, current_rank, endpoint, this_host, torch):
 
         @endpoint
         def compute(self, data: torch.Tensor) -> dict:
-            """Do some computation and return info about this worker."""
             result = data.sum().item() * (self.rank + 1)
             return {
                 "rank": self.rank,
@@ -284,7 +147,6 @@ def _(Actor, current_rank, endpoint, this_host, torch):
     procs = host.spawn_procs(per_host={"gpus": 4})
     workers = procs.spawn("workers", Worker)
 
-    print("\n=== Calling all workers ===")
     # Call all workers with the same data
     data = torch.randn(10, 10)
     results = workers.compute.call(data).get()
@@ -307,8 +169,6 @@ def _(mo):
 
 @app.cell
 def _(torch, workers):
-    # Using workers from previous cell
-
     # Call all workers
     all_results = workers.compute.call(torch.ones(5, 5)).get()
     print(f"All workers returned: {list(all_results.values())}")
@@ -330,8 +190,8 @@ def _(mo):
     mo.md(r"""
     ## All Logs in One Place
 
-    When actors print, their output is aggregated back to your controller.
-    No more SSH-ing into nodes to check logs!
+    When actors print, their output is aggregated back to your controller — no
+    SSH-ing into nodes to check logs.
     """)
     return
 
@@ -352,15 +212,11 @@ def _(Actor, current_rank, endpoint, this_host):
             print(f"[Rank {self.rank}] Completed task {task_id}")
             return f"rank_{self.rank}_task_{task_id}"
 
-    # Spawn workers
     verbose_procs = this_host().spawn_procs(per_host={"gpus": 3})
     verbose_workers = verbose_procs.spawn("verbose", VerboseWorker)
 
-    print("\n=== Running tasks ===")
-    # All workers work on the same task - watch the interleaved logs!
+    # All workers work on the same task — watch the interleaved logs
     verbose_results = verbose_workers.do_work.call(42).get()
-
-    print("\n=== Results ===")
     for _point, _result in verbose_results.items():
         print(f"  {_result}")
     return
@@ -403,17 +259,32 @@ def _(Actor, current_rank, endpoint, this_host):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## Putting It Together
+    ## On a Real Cluster
 
-    The Monarch development workflow:
+    Everything we just did locally works the same on a SLURM cluster. The only
+    difference is how you get your hosts:
 
-    1. **Start session**: `this_host().spawn_procs()` (or allocate real hosts)
-    2. **Write actor code**: Define your `Actor` classes with `@endpoint` methods
-    3. **Spawn and test**: `procs.spawn("name", MyActor)` then call endpoints
-    4. **See errors immediately**: Full tracebacks in your terminal
-    5. **Fix and respawn**: No queue wait, no reallocation
+    ```python
+    from monarch.job import SlurmJob
 
-    This is what we mean by "interactive distributed development."
+    # Allocate hosts (slow, one time)
+    job = SlurmJob(meshes={"workers": 4}, gpus_per_node=8)
+    host_mesh = job.state().workers
+
+    # From here, same pattern as this_host()
+    proc_mesh = host_mesh.spawn_procs(per_host={"gpus": 8})
+    trainers = proc_mesh.spawn("trainer", TrainerActor)
+    trainers.train.call(dataset).get()
+
+    # Iterate without re-allocating
+    proc_mesh_2 = host_mesh.spawn_procs(per_host={"gpus": 8})  # Fast!
+    ```
+
+    The key insight: `SlurmJob` handles the slow allocation step. Everything after
+    that — `spawn_procs`, `spawn`, `call` — is the same API you just used with
+    `this_host()`.
+
+    TODO - pointer to `monarchrun` to wrap existing SPMD workloads
     """)
     return
 
@@ -426,22 +297,14 @@ def _(mo):
     **Key takeaways:**
 
     1. **Decouple allocation from iteration**: Allocate hosts once, spawn fast
-    2. **Three-layer stack**: Boot → Coordination → Application
-    3. **`this_host()`**: Local development with the same patterns as real clusters
-    4. **Mesh operations**: `call()`, `slice()`, `call_one()` for flexible actor interaction
-    5. **Aggregated everything**: Logs and errors come back to you
+    2. **`this_host()`** for local dev, **`SlurmJob`** for clusters — same code
+    3. **Mesh operations**: `.call()` broadcasts, `.slice()` targets, `.call_one()`
+       returns a single value
+    4. **Aggregated everything**: Logs and errors come back to your controller
 
-    **Next:** Fault Tolerance - what happens when things go wrong at scale
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ---
-
-    **TODO:** Live demo of `monarch run`
+    We just caught a single failure with try/except. But remember those 419
+    interruptions from Llama 3 training? When failures hit every 3 hours across
+    16,000 GPUs, you need something more systematic. That's next.
     """)
     return
 
