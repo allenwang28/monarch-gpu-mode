@@ -1286,11 +1286,16 @@ def _(BATCH_SIZE, NUM_STEPS, TimingEvent, TimingStats, actors, time):
                 # generate with the latest policy -- truly synchronous RL)
                 try:
                     handle, param_meta, version, total_bytes = trainer.get_weight_handle.call_one().get()
+
+                    # Fetch state dict once (not per-generator) for fallback path
+                    state_dict, ver = None, None
+                    if handle is None:
+                        state_dict, ver = trainer.get_state_dict.call_one().get()
+
                     for w in gen_worker_list:
                         if handle is not None:
                             w.sync_weights_from_buffer.call_one(handle, param_meta, version, total_bytes).get()
                         else:
-                            state_dict, ver = trainer.get_state_dict.call_one().get()
                             w.sync_weights.call_one(state_dict, ver).get()
                 except Exception:
                     pass  # Non-fatal: generator will use slightly stale weights

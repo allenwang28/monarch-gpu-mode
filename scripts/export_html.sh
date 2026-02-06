@@ -30,7 +30,8 @@ for notebook in "$NOTEBOOKS_DIR"/*.py; do
         echo "Exporting: $basename.py -> $basename.html"
 
         # Run marimo export (runs the notebook and captures output)
-        uv run marimo export html "$notebook" -o "$output_file" --include-code 2>&1 || {
+        # -f forces overwrite without prompting
+        uv run marimo export html "$notebook" -o "$output_file" --include-code -f 2>&1 || {
             echo "  WARNING: Failed to export $basename.py (might have execution errors)"
             continue
         }
@@ -43,39 +44,170 @@ done
 echo ""
 echo "Creating index.html..."
 
-cat > "$OUTPUT_DIR/index.html" << 'EOF'
+cat > "$OUTPUT_DIR/index.html" << 'INDEXEOF'
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Monarch GPU Mode Notebooks</title>
+  <title>Monarch for GPU Mode</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
-    h1 { color: #333; }
-    ul { list-style: none; padding: 0; }
-    li { margin: 15px 0; }
-    a { color: #0066cc; text-decoration: none; font-size: 1.1em; }
-    a:hover { text-decoration: underline; }
-    .desc { color: #666; font-size: 0.9em; margin-left: 20px; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 860px;
+      margin: 50px auto;
+      padding: 20px;
+      color: #1a1a1a;
+      line-height: 1.6;
+    }
+    h1 { margin-bottom: 0.3em; }
+    .subtitle { color: #555; font-size: 1.1em; margin-bottom: 1.5em; }
+    .intro {
+      background: #f8f9fa;
+      border-left: 4px solid #0066cc;
+      padding: 16px 20px;
+      margin-bottom: 2em;
+      border-radius: 0 6px 6px 0;
+    }
+    .intro p { margin: 0.5em 0; }
+    .intro a { color: #0066cc; }
+    .notebooks { list-style: none; padding: 0; }
+    .notebooks li {
+      margin: 0;
+      border-bottom: 1px solid #eee;
+    }
+    .notebooks li:last-child { border-bottom: none; }
+    .notebooks a {
+      display: block;
+      padding: 14px 16px;
+      color: #0066cc;
+      text-decoration: none;
+      font-size: 1.05em;
+      border-radius: 6px;
+    }
+    .notebooks a:hover {
+      background: #f0f6ff;
+    }
+    .nb-num {
+      color: #999;
+      font-size: 0.85em;
+      font-family: monospace;
+      margin-right: 8px;
+    }
+    .nb-desc {
+      display: block;
+      color: #666;
+      font-size: 0.85em;
+      margin-top: 2px;
+      margin-left: 36px;
+    }
+    .section-label {
+      color: #999;
+      font-size: 0.8em;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-top: 1.5em;
+      margin-bottom: 0.3em;
+      padding-left: 16px;
+    }
+    .marimo-note {
+      margin-top: 2em;
+      padding: 12px 16px;
+      background: #f0f6ff;
+      border-radius: 6px;
+      font-size: 0.9em;
+      color: #444;
+    }
+    .marimo-note a { color: #0066cc; }
+    code { background: #eee; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
   </style>
 </head>
 <body>
-  <h1>Monarch GPU Mode Notebooks</h1>
-  <p>Interactive notebooks for the GPU Mode presentation on Monarch.</p>
-  <ul>
-EOF
+  <h1>Monarch for GPU Mode</h1>
+  <p class="subtitle">A hands-on introduction to building distributed systems with Monarch</p>
 
-for f in "$OUTPUT_DIR"/*.html; do
-    if [ "$(basename "$f")" != "index.html" ]; then
-        name=$(basename "$f" .html)
-        echo "    <li><a href=\"${name}.html\">${name}</a></li>" >> "$OUTPUT_DIR/index.html"
-    fi
-done
+  <div class="intro">
+    <p>
+      These are interactive <a href="https://marimo.io">marimo</a> notebooks
+      from a <a href="https://gpu-mode.com">GPU Mode</a> presentation on
+      <a href="https://github.com/pytorch/monarch">Monarch</a> &mdash; PyTorch's
+      framework for distributed actors, fault tolerance, and async RL.
+    </p>
+    <p>
+      <strong>Want to run these yourself?</strong> Clone the repo and run with marimo:
+    </p>
+    <p>
+      <code>git clone https://github.com/allenwang28/monarch-gpu-mode</code><br>
+      <code>cd monarch-gpu-mode && uv sync</code><br>
+      <code>uv run marimo edit notebooks/01_history_and_vision.py</code>
+    </p>
+  </div>
 
-cat >> "$OUTPUT_DIR/index.html" << 'EOF'
+  <p class="section-label">Part 1 &mdash; Monarch Deep Dive</p>
+  <ul class="notebooks">
+    <li>
+      <a href="01_history_and_vision.html">
+        <span class="nb-num">01</span> Monarch: History &amp; Vision
+        <span class="nb-desc">From tensor engine to general actor framework. Hyperactor, the World&rarr;Proc&rarr;Actor ontology, and why Monarch exists.</span>
+      </a>
+    </li>
+    <li>
+      <a href="02_interactive_devx.html">
+        <span class="nb-num">02</span> Interactive DevX: Monarch as Remote Torchrun
+        <span class="nb-desc">SPMDJob, HostMesh, spawning actors, and running distributed PyTorch interactively.</span>
+      </a>
+    </li>
+    <li>
+      <a href="03_fault_tolerance.html">
+        <span class="nb-num">03</span> Fault Tolerance in Monarch
+        <span class="nb-desc">The canonical try/except pattern, supervision trees, and graceful failure handling.</span>
+      </a>
+    </li>
   </ul>
+
+  <p class="section-label">Part 2 &mdash; Async RL from Scratch</p>
+  <ul class="notebooks">
+    <li>
+      <a href="04_rl_intro.html">
+        <span class="nb-num">04</span> RL at Scale: The Systems Problem
+        <span class="nb-desc">Why RL training is a distributed systems problem. Sync vs async, on-policy vs off-policy.</span>
+      </a>
+    </li>
+    <li>
+      <a href="05_services.html">
+        <span class="nb-num">05</span> Services: Managing Worker Pools
+        <span class="nb-desc">Round-robin routing, health tracking, failure recovery, and service discovery.</span>
+      </a>
+    </li>
+    <li>
+      <a href="06_rdma_weight_sync.html">
+        <span class="nb-num">06</span> RDMA &amp; Weight Synchronization
+        <span class="nb-desc">The magic pointer pattern, CPU staging, circular buffers, and weight re-sharding.</span>
+      </a>
+    </li>
+    <li>
+      <a href="06b_weight_sync_deep_dive.html">
+        <span class="nb-num">06b</span> Weight Sync Deep Dive
+        <span class="nb-desc">ibverbs internals, memory registration benchmarks, and full implementations.</span>
+      </a>
+    </li>
+    <li>
+      <a href="07_rl_e2e.html">
+        <span class="nb-num">07</span> Closing the Loop: Async RL Training
+        <span class="nb-desc">Full end-to-end async RL with trainers, generators, replay buffers, and weight sync.</span>
+      </a>
+    </li>
+  </ul>
+
+  <div class="marimo-note">
+    <strong>What are marimo notebooks?</strong>
+    <a href="https://marimo.io">marimo</a> is a reactive Python notebook &mdash;
+    like Jupyter, but cells re-run automatically when dependencies change, and
+    notebooks are stored as plain <code>.py</code> files. The HTML exports above
+    are read-only snapshots. To get the full interactive experience (sliders,
+    live code execution), clone the repo and run with <code>uv run marimo edit</code>.
+  </div>
 </body>
 </html>
-EOF
+INDEXEOF
 
 echo ""
 echo "Export complete!"

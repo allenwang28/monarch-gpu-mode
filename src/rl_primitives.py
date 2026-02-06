@@ -21,6 +21,7 @@ class Trajectory:
     num_tool_calls: int
     generator_id: int
     policy_version: int  # Which version of weights was used
+    model_only_text: str = ""  # Model-generated text only (no tool results)
 
 
 @dataclass

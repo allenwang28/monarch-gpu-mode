@@ -35,18 +35,21 @@ def _(mo):
     mo.md(r"""
     # Weight Sync Deep Dive
 
-    This notebook goes deeper into the implementation details of RDMA-based weight
-    synchronization. If you haven't read **Notebook 06: RDMA & Weight Sync**, start there
-    for the conceptual foundation.
+    In Notebook 06, we treated RDMA as a magic pipe: call `read_into()`, weights appear.
+    But what's actually happening when you register memory with a NIC? How much does it
+    cost, and what can go wrong if you get it wrong?
 
-    **What's covered here:**
+    This notebook opens the hood. We'll trace an RDMA transfer from ibverbs primitives
+    through Monarch's actor-based control plane, measure the hidden costs that can turn
+    a microsecond operation into a millisecond one, and build the data structures that
+    make production weight sync reliable.
 
-    1. **ibverbs Internals** - Queue Pairs, Memory Registration, how Monarch wraps it
+    **The central question: where do the milliseconds go?**
+
+    1. **ibverbs Internals** - Queue Pairs, Memory Registration, Completion Queues
     2. **Memory Registration Costs** - Benchmarking naive vs optimized approaches
-    3. **Circular Weight Buffer Implementation** - Full working code
+    3. **Circular Weight Buffer Implementation** - Full working code with lifecycle management
     4. **DTensor Re-sharding** - Computing transfer plans, the full benchmark
-
-    This is the "how it works under the hood" companion to the main notebook.
     """)
     return
 
@@ -153,6 +156,27 @@ def _(mo):
     ```
 
     The actor abstraction makes RDMA connection management natural and composable.
+
+    ### Completion Queues (CQs)
+
+    One piece we haven't mentioned: how does the initiator know an operation finished?
+    Every QP is associated with a **Completion Queue (CQ)**. When the NIC finishes an
+    RDMA operation, it posts a **completion event** to the CQ:
+
+    ```
+    App: post RDMA_READ to Send Queue
+              ↓
+    NIC: executes the read (bypasses remote CPU)
+              ↓
+    NIC: posts completion to CQ
+              ↓
+    App: poll CQ → "done, 4096 bytes transferred"
+    ```
+
+    Monarch's Rust layer (`RdmaManagerActor`) handles CQ polling internally. When you
+    call `.get()` on an RDMA future, you're ultimately waiting for a CQ completion event.
+    This is why RDMA is "one-sided" but not "zero-sided" - the *initiator* still needs
+    to know when the transfer is done.
     """)
     return
 
@@ -202,6 +226,10 @@ def _(mo):
     - Under the hood, the actual RDMA operations are in Rust (`RdmaManagerActor`)
 
     It's actors all the way down.
+
+    Now that we understand the primitives - QPs, MRs, CQs, and how Monarch wraps them -
+    the next question is: **what's the cost of getting them wrong?** Memory registration
+    turns out to be the biggest hidden tax.
     """)
     return
 
@@ -216,8 +244,12 @@ def _(mo):
     - Creates IOMMU/DMA mappings in the NIC
     - Can take milliseconds for large buffers
 
-    But here's the good news: **Monarch caches all memory region registrations.** Once a buffer
-    is registered, subsequent uses hit the cache, making it essentially free in steady state.
+    **What does Monarch cache?** The `@functools.cache` on `_ensure_init_rdma_manager` caches
+    the RDMA *manager initialization* (QP setup, control plane bootstrap) - that only happens
+    once per process. But memory region (MR) registration for CPU tensors happens on each
+    `RDMABuffer()` call. For CUDA tensors with mlx5dv, there's segment-level MR caching in
+    the driver. In the future, Monarch plans to cache all MR registrations at the Python layer,
+    but today **you** are responsible for reusing `RDMABuffer` handles to amortize MR cost.
 
     Let's benchmark 3 approaches to see this in action.
     """)
@@ -430,10 +462,16 @@ def _(
     NaiveSender,
     ScatteredReceiver,
     ScatteredSender,
+    is_rdma_available,
     this_host,
 ):
     def run_benchmark():
         """Compare the three approaches over multiple steps."""
+        if not is_rdma_available():
+            print("⚠ RDMA not available on this machine. Skipping benchmark.")
+            print("  Run on an RDMA-capable host to see real results.")
+            return None
+
         layer_sizes = [1000, 5000, 2000]  # 8000 floats total
         total_size = sum(layer_sizes)
         num_steps = 5
@@ -509,6 +547,9 @@ def _(mo):
 
     *Note: RDMAAction (~9ms) is slower than Contiguous (~4ms) due to Python overhead.
     Moving the batching logic to Rust is a planned optimization.*
+
+    With MR costs understood, we can build a data structure that keeps handles registered
+    and manages the lifecycle of weight snapshots: the circular buffer.
     """)
     return
 
@@ -519,8 +560,9 @@ def _(mo):
     ## 3. Circular Weight Buffer Implementation
 
     Here's a full working implementation of a circular buffer for versioned weight storage.
-    In production, this would be used inside a Monarch actor and slots would be registered
-    with RDMABuffer at init time.
+    This is the same pattern from Notebook 06's Section 6, but with the complete code.
+    In production, this lives inside a Monarch actor with slots pre-registered as RDMABuffers
+    at init time - so MR cost is paid once and amortized across all subsequent syncs.
     """)
     return
 
@@ -604,10 +646,39 @@ def _(torch):
 @app.cell
 def _(mo):
     mo.md(r"""
+    ### RDMABuffer Lifecycle: Don't Forget `drop()`
+
+    Every `RDMABuffer` pins physical memory and creates NIC-level mappings. If you discard
+    a Python reference without calling `drop()`, the underlying MR stays pinned in kernel
+    memory until the process exits. In a long-running actor that creates buffers dynamically,
+    this is a **memory leak**.
+
+    ```python
+    # WRONG: MR stays pinned even after Python GC collects the object
+    buf = RDMABuffer(tensor.view(torch.uint8).flatten())
+    del buf  # Python object gone, but kernel MR still pinned!
+
+    # RIGHT: explicitly release the MR before discarding
+    buf = RDMABuffer(tensor.view(torch.uint8).flatten())
+    buf.drop().get()  # Releases MR registration in the NIC
+    del buf           # Now safe
+    ```
+
+    The circular buffer pattern sidesteps this entirely: allocate N slots at init,
+    register them once, reuse forever, and only `drop()` at actor shutdown. No dynamic
+    allocation means no leak risk.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
     ## 4. DTensor Re-sharding Implementation
 
-    When trainer and generator have different tensor layouts (sharding), we need to compute
-    which chunks of data need to move from which source to which destination.
+    So far we've assumed the trainer and generator have matching tensor layouts. In practice,
+    they rarely do - different parallelism strategies mean different sharding. The final piece
+    is computing **which chunks of data need to move where** when layouts don't match.
 
     ### Computing Shard Metadata
     """)
@@ -769,7 +840,7 @@ def _(mo):
 
 
 @app.cell
-def _(Actor, RDMAAction, RDMABuffer, ShardMetadata, compute_shard_metadata, current_rank, endpoint, time, torch):
+def _(compute_shard_metadata):
     import os
     from torch.distributed._tensor import DTensor, Shard, Replicate, init_device_mesh
 
@@ -791,15 +862,20 @@ def _(Actor, RDMAAction, RDMABuffer, ShardMetadata, compute_shard_metadata, curr
         return None
 
     def compute_layer_transfer_plan(layer_cfg, trainer_ranks, gen_ranks, gen_rank):
-        """Use DTensor placement metadata to compute transfer plan for one layer."""
+        """Use DTensor placement metadata to compute transfer plan for one layer.
+
+        Returns list of trainer rank indices that have data this generator rank needs.
+        """
         trainer_dim = placement_to_shard_dim(layer_cfg["trainer_place"])
         gen_dim = placement_to_shard_dim(layer_cfg["gen_place"])
 
         if trainer_dim is None:
-            return [(0, None)]
+            # Replicated on trainer side - just read from rank 0
+            return [0]
 
         if gen_dim is None:
-            return [(t, None) for t in range(trainer_ranks)]
+            # Replicated on generator side - need all trainer shards
+            return list(range(trainer_ranks))
 
         trainer_shards = compute_shard_metadata(layer_cfg["shape"], trainer_ranks, trainer_dim)
         gen_shards = compute_shard_metadata(layer_cfg["shape"], gen_ranks, gen_dim)
@@ -814,10 +890,40 @@ def _(Actor, RDMAAction, RDMABuffer, ShardMetadata, compute_shard_metadata, curr
                      if gen_dim == trainer_dim else layer_cfg["shape"][trainer_dim])
 
             if t_end > g_start and t_start < g_end:
-                overlapping.append((t_shard.rank, t_shard))
+                overlapping.append(t_shard.rank)
 
         return overlapping
 
+    print(f"Config: {NUM_TRAINER_RANKS} trainer ranks, {NUM_GENERATOR_RANKS} generator ranks")
+    for _i, _cfg in enumerate(LAYER_CONFIGS):
+        print(f"  Layer {_i}: {_cfg['shape']}, trainer={_cfg['trainer_place']}, gen={_cfg['gen_place']}")
+    return (
+        DTensor,
+        LAYER_CONFIGS,
+        NUM_GENERATOR_RANKS,
+        NUM_TRAINER_RANKS,
+        Replicate,
+        Shard,
+        compute_layer_transfer_plan,
+        init_device_mesh,
+        os,
+        placement_to_shard_dim,
+    )
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ### DTensorTrainer
+
+    The trainer creates DTensors with the configured placements and exposes per-layer
+    RDMA handles. Each rank registers its local shard once at setup time.
+    """)
+    return
+
+
+@app.cell
+def _(Actor, LAYER_CONFIGS, RDMABuffer, current_rank, endpoint, init_device_mesh, os, placement_to_shard_dim, torch):
     class DTensorTrainer(Actor):
         """Trainer with DTensor shards."""
 
@@ -835,6 +941,8 @@ def _(Actor, RDMAAction, RDMABuffer, ShardMetadata, compute_shard_metadata, curr
                 torch.distributed.init_process_group(backend="gloo")
 
             self.device_mesh = init_device_mesh("cpu", (world_size,))
+
+            from torch.distributed._tensor import DTensor
 
             for i, cfg in enumerate(LAYER_CONFIGS):
                 placement = cfg["trainer_place"]
@@ -865,9 +973,29 @@ def _(Actor, RDMAAction, RDMABuffer, ShardMetadata, compute_shard_metadata, curr
 
         @endpoint
         def destroy(self):
+            for h in self.handles:
+                h.drop().get()
             if torch.distributed.is_initialized():
                 torch.distributed.destroy_process_group()
 
+    print("DTensorTrainer defined")
+    return (DTensorTrainer,)
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ### DTensorGenerator
+
+    The generator uses `compute_layer_transfer_plan` to figure out which trainer ranks
+    hold data it needs, then builds an `RDMAAction` transfer plan via handshake. Subsequent
+    syncs just call `action.submit()` - no recomputation needed.
+    """)
+    return
+
+
+@app.cell
+def _(Actor, LAYER_CONFIGS, NUM_GENERATOR_RANKS, NUM_TRAINER_RANKS, RDMAAction, compute_layer_transfer_plan, current_rank, endpoint, init_device_mesh, os, time, torch):
     class DTensorGenerator(Actor):
         """Generator that uses DTensor placement metadata for smart resharding."""
 
@@ -898,7 +1026,7 @@ def _(Actor, RDMAAction, RDMABuffer, ShardMetadata, compute_shard_metadata, curr
                     cfg, NUM_TRAINER_RANKS, NUM_GENERATOR_RANKS, self.rank
                 )
 
-                for t_rank, _ in overlapping:
+                for t_rank in overlapping:
                     shape, handle = trainers[t_rank].get_layer_handle.call_one(layer_idx).get()
                     buf = torch.zeros(shape, dtype=torch.float32)
                     self.recv_buffers.append(buf)
@@ -919,16 +1047,8 @@ def _(Actor, RDMAAction, RDMABuffer, ShardMetadata, compute_shard_metadata, curr
             if torch.distributed.is_initialized():
                 torch.distributed.destroy_process_group()
 
-    print("DTensor actors defined")
-    return (
-        DTensorGenerator,
-        DTensorTrainer,
-        LAYER_CONFIGS,
-        NUM_GENERATOR_RANKS,
-        NUM_TRAINER_RANKS,
-        compute_layer_transfer_plan,
-        placement_to_shard_dim,
-    )
+    print("DTensorGenerator defined")
+    return (DTensorGenerator,)
 
 
 @app.cell
@@ -938,53 +1058,58 @@ def _(
     LAYER_CONFIGS,
     NUM_GENERATOR_RANKS,
     NUM_TRAINER_RANKS,
+    is_rdma_available,
     this_host,
     time,
 ):
     from monarch.spmd import setup_torch_elastic_env
 
-    _trainer_procs = this_host().spawn_procs(per_host={"procs": NUM_TRAINER_RANKS})
-    setup_torch_elastic_env(_trainer_procs)
-    _trainers = _trainer_procs.spawn("trainers", DTensorTrainer)
+    if not is_rdma_available():
+        print("⚠ RDMA not available on this machine. Skipping DTensor benchmark.")
+        print("  Run on an RDMA-capable host to see real results.")
+    else:
+        _trainer_procs = this_host().spawn_procs(per_host={"procs": NUM_TRAINER_RANKS})
+        setup_torch_elastic_env(_trainer_procs)
+        _trainers = _trainer_procs.spawn("trainers", DTensorTrainer)
 
-    _gen_procs = this_host().spawn_procs(per_host={"procs": NUM_GENERATOR_RANKS})
-    setup_torch_elastic_env(_gen_procs)
-    _generators = _gen_procs.spawn("generators", DTensorGenerator)
+        _gen_procs = this_host().spawn_procs(per_host={"procs": NUM_GENERATOR_RANKS})
+        setup_torch_elastic_env(_gen_procs)
+        _generators = _gen_procs.spawn("generators", DTensorGenerator)
 
-    print("\n=== DTensor Reshard Benchmark ===")
-    print(f"Trainer mesh: {NUM_TRAINER_RANKS} ranks, Generator mesh: {NUM_GENERATOR_RANKS} ranks")
-    print("Layer configs:")
-    for i, cfg in enumerate(LAYER_CONFIGS):
-        print(f"  Layer {i}: {cfg['shape']}, trainer={cfg['trainer_place']}, gen={cfg['gen_place']}")
+        print("\n=== DTensor Reshard Benchmark ===")
+        print(f"Trainer mesh: {NUM_TRAINER_RANKS} ranks, Generator mesh: {NUM_GENERATOR_RANKS} ranks")
+        print("Layer configs:")
+        for i, cfg in enumerate(LAYER_CONFIGS):
+            print(f"  Layer {i}: {cfg['shape']}, trainer={cfg['trainer_place']}, gen={cfg['gen_place']}")
 
-    print("\nSetting up distributed...")
-    _trainer_shapes = _trainers.setup_distributed.call().get()
-    _gen_world = _generators.setup_distributed.call().get()
-    print(f"  Trainer shapes: {[s for _, s in _trainer_shapes]}")
-    print(f"  Generator world sizes: {[w for _, w in _gen_world]}")
+        print("\nSetting up distributed...")
+        _trainer_shapes = _trainers.setup_distributed.call().get()
+        _gen_world = _generators.setup_distributed.call().get()
+        print(f"  Trainer shapes: {[s for _, s in _trainer_shapes]}")
+        print(f"  Generator world sizes: {[w for _, w in _gen_world]}")
 
-    _trainer_list = [_trainers.slice(procs=i) for i in range(NUM_TRAINER_RANKS)]
+        _trainer_list = [_trainers.slice(procs=i) for i in range(NUM_TRAINER_RANKS)]
 
-    print("\nBuilding transfer plans (using placement metadata)...")
-    _results = _generators.handshake_routed.call(_trainer_list).get()
-    for _i, _r in enumerate(_results):
-        print(f"  Generator {_i}: {_r}")
+        print("\nBuilding transfer plans (using placement metadata)...")
+        _results = _generators.handshake_routed.call(_trainer_list).get()
+        for _i, _r in enumerate(_results):
+            print(f"  Generator {_i}: {_r}")
 
-    print("\nRunning transfers...")
-    _times = []
-    for _step in range(3):
-        _step_start = time.perf_counter()
-        _results = _generators.receive_routed.call().get()
-        _step_ms = (time.perf_counter() - _step_start) * 1000
-        _times.append(_step_ms)
-        print(f"  Step {_step + 1}: {_step_ms:.1f}ms")
+        print("\nRunning transfers...")
+        _times = []
+        for _step in range(3):
+            _step_start = time.perf_counter()
+            _results = _generators.receive_routed.call().get()
+            _step_ms = (time.perf_counter() - _step_start) * 1000
+            _times.append(_step_ms)
+            print(f"  Step {_step + 1}: {_step_ms:.1f}ms")
 
-    _avg = sum(_times) / len(_times)
-    print(f"  Average: {_avg:.1f}ms")
+        _avg = sum(_times) / len(_times)
+        print(f"  Average: {_avg:.1f}ms")
 
-    _trainers.destroy.call().get()
-    _generators.destroy.call().get()
-    print("\nDistributed cleanup complete")
+        _trainers.destroy.call().get()
+        _generators.destroy.call().get()
+        print("\nDistributed cleanup complete")
     return (setup_torch_elastic_env,)
 
 
@@ -993,15 +1118,18 @@ def _(mo):
     mo.md(r"""
     ## Summary
 
-    This deep dive covered:
+    We started with a question - *where do the milliseconds go?* - and traced the answer
+    through four layers:
 
-    1. **ibverbs internals** - QP setup, MR registration, how Monarch wraps it all
-    2. **Memory registration costs** - Why naive approaches are slow, how caching helps
-    3. **Circular weight buffers** - Full implementation with versioning
-    4. **DTensor re-sharding** - Computing transfer plans from placement metadata
+    1. **ibverbs internals** - QPs, MRs, CQs: the primitives that make RDMA work
+    2. **Memory registration costs** - The hidden tax of naive buffer management, and how
+       reusing handles amortizes it away
+    3. **Circular weight buffers** - Structural coordination with proper `drop()` lifecycle
+    4. **DTensor re-sharding** - Computing minimal transfer plans from placement metadata
 
     These are the building blocks that make Monarch's weight sync fast and flexible.
-    The main notebook (06) covers when and why to use these patterns.
+    The main notebook (06) covers when and why to use these patterns; this notebook
+    showed *how* they work under the hood.
     """)
     return
 
