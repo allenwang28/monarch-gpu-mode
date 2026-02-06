@@ -82,7 +82,6 @@ def _(mo):
 # Cell 4: Core imports
 @app.cell
 def _():
-    from typing import Optional
     from collections import deque
     import random
     import torch
@@ -290,7 +289,13 @@ def _(mo):
     the trainer samples batches out. The `clear()` endpoint lets us reset between
     sync and async runs for a fair comparison.
 
-    This enables async RL -- generation and training happen independently,
+    **Why a buffer?** Without it, the trainer would train on each trajectory
+    immediately after it's generated -- consecutive samples from the same generator
+    are highly correlated (same policy, similar tasks). Random sampling from a buffer
+    decorrelates the training data, giving better gradient estimates. This is the same
+    principle behind experience replay in DQN and other off-policy methods.
+
+    The buffer also enables async RL: generation and training happen independently,
     connected only through the buffer.
     """)
     return
@@ -365,6 +370,22 @@ def _(mo):
 
     This weights the entire response by the advantage. Positive advantage reinforces
     the response; negative advantage suppresses it.
+
+    The **baseline** is an exponential moving average (EMA) of past rewards:
+    `baseline = 0.9 * baseline + 0.1 * avg_reward`. This reduces gradient variance
+    without introducing bias -- the baseline shifts the advantage up or down but
+    doesn't change the direction of the gradient in expectation.
+
+    **Approximation note:** In a multi-turn tool-use setting, `model_only_text`
+    concatenates the model's generated tokens across turns *without* the injected
+    tool results. This means the model sees a different context during training
+    (prompt + model text) than during generation (prompt + model text + tool results
+    interleaved). The log-probabilities are therefore computed under a slightly
+    different distribution than the one that produced the trajectory. This is a
+    known approximation -- full-fidelity training would reconstruct the exact
+    multi-turn conversation, but that adds significant complexity. For a pedagogical
+    notebook, the approximation is acceptable and the gradient signal still points
+    in the right direction.
 
     **Circular buffer with CPU staging** (from NB06): Instead of registering RDMA
     handles directly on GPU parameters (which blocks training during reads), we
@@ -877,6 +898,14 @@ def _(mo):
     thread; training runs in the main thread. We cannot use async endpoints in this
     environment, so threading is the right tool.
 
+    **Trade-off: policy staleness.** In async mode, generators produce trajectories
+    using an older version of the policy while the trainer has already moved on.
+    This is *off-policy* data -- the log-probabilities computed during training
+    don't match the policy that generated the trajectory. With REINFORCE this
+    introduces some bias. More sophisticated algorithms (PPO, GRPO) address this
+    with importance sampling ratios (`pi_new / pi_old`) and clipping, but that's
+    beyond our scope here. For a small model with few steps, the staleness is mild.
+
     We'll run BOTH modes with the **same actors** and compare wall time, throughput,
     and utilization.
     """)
@@ -893,36 +922,31 @@ def _(mo):
     mo.md(f"""
     ## Configuration
 
-    Adjust parameters for the training run. Actors are spawned once and reused
-    for both sync and async modes.
+    Adjust parameters for the training run. **Marimo is reactive**: changing a slider
+    re-runs all downstream cells that depend on it. This means actors will be
+    re-spawned and both training loops will re-execute with the new values.
 
     {num_steps_slider}
 
     {num_generators_slider}
 
     {batch_size_slider}
+
+    **Suggestions:** Start with defaults (5 steps, 2 generators, batch 4) to see the
+    full pipeline. Then try increasing generators to 3-4 to see the async throughput
+    advantage grow. Increasing training steps gives the model more updates but adds
+    wall time. Note that re-spawning actors (loading models onto GPUs) is the most
+    expensive part of the setup -- the training loops themselves are relatively fast.
     """)
     return batch_size_slider, num_generators_slider, num_steps_slider
 
 
-# Cell 21: TimingStats/TimingEvent + setup_actors
+# Cell 21a: Timing dataclasses
 @app.cell
-def _(
-    GeneratorWorker,
-    ReplayBuffer,
-    Service,
-    TrainerActor,
-    ZorplexWorker,
-    batch_size_slider,
-    num_generators_slider,
-    num_steps_slider,
-    register_service,
-):
+def _():
     import threading
     import time
     from dataclasses import dataclass, field
-
-    from monarch.actor import this_host
 
     @dataclass
     class TimingEvent:
@@ -953,6 +977,29 @@ def _(
         @property
         def steps_per_second(self) -> float:
             return self.num_steps / self.wall_time if self.wall_time > 0 else 0
+    return (
+        TimingEvent,
+        TimingStats,
+        field,
+        threading,
+        time,
+    )
+
+
+# Cell 21b: Configuration constants + setup_actors
+@app.cell
+def _(
+    GeneratorWorker,
+    ReplayBuffer,
+    Service,
+    TrainerActor,
+    ZorplexWorker,
+    batch_size_slider,
+    num_generators_slider,
+    num_steps_slider,
+    register_service,
+):
+    from monarch.actor import this_host
 
     NUM_STEPS = num_steps_slider.value
     NUM_GENERATORS = num_generators_slider.value
@@ -1019,14 +1066,9 @@ def _(
         NUM_GENERATORS,
         NUM_STEPS,
         NUM_ZORPLEX,
-        TimingEvent,
-        TimingStats,
         actors,
-        field,
         setup_actors,
-        threading,
         this_host,
-        time,
     )
 
 
@@ -1419,7 +1461,12 @@ def _(async_stats, mo, sync_stats):
     fig.legend(handles=legend_patches, loc="upper right", framealpha=0.9)
 
     plt.tight_layout()
-    mo.md("### Timeline Visualization")
+    mo.md("""### Timeline Visualization
+
+The Gantt charts below show what each actor was doing over time. In sync mode,
+bars are strictly sequential. In async mode, generators and trainer overlap --
+that overlap is where the throughput gain comes from.
+""")
     return
 
 
