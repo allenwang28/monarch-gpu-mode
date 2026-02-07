@@ -155,11 +155,13 @@ class SimpleLookupSpec(TaskSpec):
 
 You have access to a LOOKUP tool. To find the zorplex value of a word, simply output LOOKUP[word] on its own line. The system will return the value to you. Do NOT write code - just output the tool call directly.
 
+When you have your final answer, state it as [ANSWER] <number>.
+
 Example:
 User: What is the zorplex value of 'cat'?
 Assistant: LOOKUP[cat]
 [Result: 42]
-Assistant: The zorplex value of 'cat' is 42."""
+Assistant: [ANSWER] 42"""
         return base
 
     def parse_tool_calls(self, text: str) -> list[ToolCall]:
@@ -173,6 +175,11 @@ Assistant: The zorplex value of 'cat' is 42."""
         return "UNKNOWN_TOOL"
 
     def extract_answer(self, text: str, tool_calls: list[ToolCall]) -> int | None:
+        # Check for [ANSWER] tag first
+        answer_match = re.findall(r'\[ANSWER\]\s*(\d+)', text)
+        if answer_match:
+            return int(answer_match[-1])
+
         # If model made correct tool call, use that result
         for tc in tool_calls:
             if tc.result is not None and isinstance(tc.result, int):
@@ -242,7 +249,7 @@ You have access to a LOOKUP tool. To find the zorplex value of a word, simply ou
 
 For problems requiring multiple lookups, call LOOKUP once, wait for the result, then call it again.
 
-After computing the result, always state your final answer in the format: 'The answer is <number>.'
+When you have your final answer, state it as [ANSWER] <number>.
 
 Example:
 User: What is zorplex('cat') + zorplex('dog')?
@@ -250,7 +257,7 @@ Assistant: LOOKUP[cat]
 [Result: 42]
 Assistant: LOOKUP[dog]
 [Result: 17]
-Assistant: 42 + 17 = 59. The answer is 59."""
+Assistant: 42 + 17 = 59. [ANSWER] 59"""
         return base
 
     def parse_tool_calls(self, text: str) -> list[ToolCall]:
@@ -264,6 +271,11 @@ Assistant: 42 + 17 = 59. The answer is 59."""
         return "UNKNOWN_TOOL"
 
     def extract_answer(self, text: str, tool_calls: list[ToolCall]) -> int | None:
+        # Check for [ANSWER] tag first
+        answer_match = re.findall(r'\[ANSWER\]\s*(-?\d+)', text)
+        if answer_match:
+            return int(answer_match[-1])
+
         # Try to find explicit answer patterns - use findall and take the last match
         patterns = [
             r'(?:the answer is|answer is|answer:)\s*(-?\d+)',
@@ -324,13 +336,15 @@ You have access to two tools: GETKEY and FETCH. To find the zorplex value of a w
 
 Do NOT write code - just output the tool calls directly and wait for results.
 
+When you have your final answer, state it as [ANSWER] <number>.
+
 Example:
 User: What is the zorplex value of 'apple'?
 Assistant: GETKEY[apple]
 [Result: ZK_6368CC]
 Assistant: FETCH[ZK_6368CC]
 [Result: 82]
-Assistant: The zorplex value of 'apple' is 82."""
+Assistant: [ANSWER] 82"""
         return base
 
     def parse_tool_calls(self, text: str) -> list[ToolCall]:
@@ -372,6 +386,11 @@ Assistant: The zorplex value of 'apple' is 82."""
         return "UNKNOWN_TOOL"
 
     def extract_answer(self, text: str, tool_calls: list[ToolCall]) -> int | None:
+        # Check for [ANSWER] tag first
+        answer_match = re.findall(r'\[ANSWER\]\s*(\d+)', text)
+        if answer_match:
+            return int(answer_match[-1])
+
         # Check if a FETCH call returned a valid result
         for tc in tool_calls:
             if tc.tool_name == "FETCH" and isinstance(tc.result, int):
@@ -503,6 +522,8 @@ IMPORTANT: Some lookups return a redirect like "SEE: other_word". When this happ
 
 Do NOT write code - just output the tool calls directly and wait for results.
 
+When you have your final answer, state it as [ANSWER] <number>.
+
 Example:
 User: What is the zorplex value of 'apple'?
 Assistant: LOOKUP[apple]
@@ -511,7 +532,7 @@ Assistant: LOOKUP[banana]
 [Result: SEE: cat]
 Assistant: LOOKUP[cat]
 [Result: 42]
-Assistant: The zorplex value of 'apple' is 42."""
+Assistant: [ANSWER] 42"""
         return base
 
     def parse_tool_calls(self, text: str) -> list[ToolCall]:
@@ -527,6 +548,11 @@ Assistant: The zorplex value of 'apple' is 42."""
         return "UNKNOWN_TOOL"
 
     def extract_answer(self, text: str, tool_calls: list[ToolCall]) -> int | None:
+        # Check for [ANSWER] tag first
+        answer_match = re.findall(r'\[ANSWER\]\s*(\d+)', text)
+        if answer_match:
+            return int(answer_match[-1])
+
         # Look for the last LOOKUP that returned an int
         for tc in reversed(tool_calls):
             if tc.result is not None and isinstance(tc.result, int):

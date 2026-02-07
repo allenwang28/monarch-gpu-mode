@@ -1,12 +1,13 @@
 import marimo
 
-__generated_with = "0.19.7"
+__generated_with = "0.19.9"
 app = marimo.App(width="medium")
 
 
 @app.cell
 def _():
     import marimo as mo
+
     return (mo,)
 
 
@@ -29,12 +30,13 @@ def _(mo):
 
     This notebook establishes the groundwork:
 
-    1. **The task** — a synthetic benchmark where the model has room to improve
+    1. **The task** — identifying a synthetic benchmark where the model has room to improve
     2. **The reward** — fully verifiable, no ambiguity
     3. **The bottleneck** — why synchronous RL wastes GPUs
     4. **The architecture** — async RL, and why it maps to actors
 
-    But first: does our model actually *need* RL? Let's find out.
+    But first: **when does RL actually need distributed systems?** Let's build
+    intuition.
     """)
     return
 
@@ -109,15 +111,18 @@ def _(device, model, tokenizer, torch):
     print(gsm8k_problem)
     print("\nMODEL RESPONSE:")
     print(response)
-    print(f"\n✓ CORRECT ANSWER: $18  →  (16 - 3 - 4) × $2 = 9 × $2 = $18")
+    print("="*10)
+    print("\nThe correct answer should be: $18  →  (16 - 3 - 4) × $2 = 9 × $2 = $18")
     return
 
 
 @app.cell
 def _(mo):
     mo.md(r"""
-    Even at 0.5B parameters, Qwen 2.5 can generate the right reasoning trace
-    here — but it doesn't always. That's actually a nice property: the fact
+    Even at 0.5B parameters, Qwen 2.5 can generate a convincing looking reasoning trace
+     — but it doesn't always produce the right answer.
+
+    That's actually a nice property: the fact
     that the model *sometimes* gets answers right gives us confidence that
     further training can elicit more of this behavior. If it never succeeded,
     RL would have no positive signal to reinforce.
@@ -352,59 +357,110 @@ def _(benchmark_results, mo):
     |------|-------------|----------|
     {table_md}
 
-    **Key observations:**
+    Accuracy is lower than you might expect — and that's largely because of the
+    `[ANSWER]` format requirement. The model can often get *right value* but
+    fails to emit it in the required format. This is actually good news for RL:
+    the capability is there, it just needs to be reinforced.
 
-    - **Simple lookup** works perfectly - the model can call a tool and report the result
-    - **Compositional** struggles - arithmetic errors after correct tool calls
-    - **Multi-step** (GETKEY → FETCH chain) also works well - sequential tool use is fine
-    - **Recursive** has some failures - model sometimes mimics the injection format instead of calling tools
-
-    The model can use tools. It struggles when it needs to **compose** tool results with reasoning (arithmetic) or follow **dynamic chains** (recursive lookups).
-
-    **This is exactly what RL can teach it.**
+    Let's look at concrete trajectories to understand the failure modes.
     """)
     return
 
 
 @app.cell
 def _(benchmark_results, print_result):
-    # Show some example trajectories
-    print("=" * 70)
-    print("EXAMPLE TRAJECTORIES")
-    print("=" * 70)
+    import re as _re
 
-    # Show a compositional failure
-    comp_failures = [r for r in benchmark_results["compositional"]["results"] if not r.is_correct]
-    if comp_failures:
-        print("\n--- Compositional failure example ---")
-        print_result(comp_failures[0])
+    # Classify results by failure mode
+    successes = []
+    format_failures = []  # Right value, wrong format
+    tool_spam = []        # Excessive tool calls without progress
+    wrong_answer = []     # Wrong computation or value
 
-    # Show a recursive success
-    rec_successes = [r for r in benchmark_results["recursive"]["results"] if r.is_correct]
-    if rec_successes:
-        print("\n--- Recursive success example ---")
-        print_result(rec_successes[0])
+    for _task_name, _data in benchmark_results.items():
+        for _r in _data["results"]:
+            if _r.is_correct:
+                successes.append((_task_name, _r))
+            else:
+                # Check if the correct answer appears in the trajectory but wasn't extracted
+                correct_str = str(_r.task.correct_answer)
+                has_correct_value = correct_str in _r.final_text
+
+                # Check for [ANSWER] tag presence
+                has_answer_tag = bool(_re.search(r'\[ANSWER\]', _r.final_text))
+
+                if not has_answer_tag:
+                    format_failures.append((_task_name, _r))
+                elif _r.total_tool_calls > 3:
+                    tool_spam.append((_task_name, _r))
+                else:
+                    wrong_answer.append((_task_name, _r))
+
+    # --- Successes ---
+    print("=" * 70)
+    print(f"SUCCESS EXAMPLES ({len(successes)} total)")
+    print("=" * 70)
+    for _task_name, _r in successes[:2]:
+        print(f"\n--- {_task_name} ---")
+        print_result(_r)
+
+    # --- Format failures ---
+    print("\n" + "=" * 70)
+    print(f"FAILURE MODE 1: Wrong format ({len(format_failures)} total)")
+    print("The model never emitted [ANSWER].")
+    print("=" * 70)
+    for _task_name, _r in format_failures[:2]:
+        print(f"\n--- {_task_name} ---")
+        print_result(_r)
+
+    # --- Tool spam ---
+    if tool_spam:
+        print("\n" + "=" * 70)
+        print(f"FAILURE MODE 2: Tool spam ({len(tool_spam)} total)")
+        print("Excessive tool calls without making progress.")
+        print("=" * 70)
+        for _task_name, _r in tool_spam[:2]:
+            print(f"\n--- {_task_name} ---")
+            print_result(_r)
+
+    # --- Wrong answer ---
+    if wrong_answer:
+        print("\n" + "=" * 70)
+        print(f"FAILURE MODE 3: Wrong answer ({len(wrong_answer)} total)")
+        print("Incorrect computation or value extraction.")
+        print("=" * 70)
+        for _task_name, _r in wrong_answer[:2]:
+            print(f"\n--- {_task_name} ---")
+            print_result(_r)
+
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"  Successes:              {len(successes)}")
+    print(f"  Right value, bad format: {len(format_failures)}")
+    print(f"  Tool spam:              {len(tool_spam)}")
+    print(f"  Wrong answer:           {len(wrong_answer)}")
     return
 
 
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## Why This Makes a Good RL Target
+    ## From Failure Modes to RL Rewards
 
-    The Zorplex benchmark is a toy example, but it illustrates the key properties we need for RL:
+    The trajectories above reveal three distinct failure modes, and each maps
+    to a reward signal:
 
-    1. **Clear capability gap** - The model succeeds at simple tasks but fails at compositional ones
-    2. **Fully verifiable** - We know the ground truth with 100% certainty
-    3. **Synthetic = no memorization** - The model must actually learn the skill
-    4. **Incremental difficulty** - We can curriculum from simple → compositional → recursive
+    | Failure Mode | What Happens | RL Signal |
+    |---|---|---|
+    | **Wrong format** | Model doesn't emit `[ANSWER]` | Reward format compliance |
+    | **Tool spam** | Excessive LOOKUPs without progress | Penalize unnecessary tool calls |
+    | **Wrong answer** | Incorrect arithmetic or value extraction | Binary correctness reward (0 or 1) |
 
-    The RL objective is straightforward:
-    - **Reward = 1** if final answer matches ground truth
-    - **Reward = 0** otherwise
-
-    Same pattern as GSM8K — and as we saw there, the model already succeeds
-    at some tasks, so RL has positive signal to amplify.
+    The key insight: **the model already has most of the capability**. It can
+    call tools, follow redirects, and often arrives at the right value. What
+    it lacks is the discipline to format answers correctly and compose results
+    reliably. These are exactly the behaviors RL can reinforce.
 
     Now let's talk about how to build the training loop...
     """)
@@ -421,6 +477,12 @@ def _(mo):
     signal. For Zorplex, this means it can discover on its own that guessing
     values gives reward 0, while calling LOOKUP gives reward 1. No one needs
     to show it the right trajectory.
+
+    **Note on reward design:** The binary reward (correct=1, incorrect=0) is
+    simple but sparse. In practice, you might add **reward shaping** —
+    penalties for excessive tool calls (compositional tasks tend to spam
+    LOOKUP), bonuses for correct output formatting. We'll explore shaped
+    rewards in NB07 when we wire up the full RL loop.
 
     The standard **synchronous RL loop** looks like this:
 

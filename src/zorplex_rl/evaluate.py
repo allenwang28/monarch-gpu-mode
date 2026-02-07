@@ -52,15 +52,17 @@ class StopAtToolCall(StoppingCriteria):
         self.tokenizer = tokenizer
         self.prompt_length = prompt_length
         # Match tool calls: LOOKUP[word], GETKEY[word], FETCH[ZK_XXX]
-        self.pattern = re.compile(r"(LOOKUP|GETKEY|FETCH)\[[^\]]+\]", re.IGNORECASE)
+        self.tool_pattern = re.compile(r"(LOOKUP|GETKEY|FETCH)\[[^\]]+\]", re.IGNORECASE)
+        # Match final answer tag: [ANSWER] <number>
+        self.answer_pattern = re.compile(r"\[ANSWER\]\s*-?\d+", re.IGNORECASE)
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
         # Only check newly generated tokens
         new_tokens = input_ids[0, self.prompt_length:]
         new_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
 
-        # Stop if we find a complete tool call
-        return bool(self.pattern.search(new_text))
+        # Stop if we find a complete tool call or an [ANSWER] tag
+        return bool(self.tool_pattern.search(new_text) or self.answer_pattern.search(new_text))
 
 
 def generate_with_tools(
@@ -131,7 +133,10 @@ def generate_with_tools(
         # Find tool calls in the new text
         tool_calls = spec.parse_tool_calls(new_text)
 
-        if not tool_calls:
+        # Check if model emitted [ANSWER] tag — treat as final turn
+        has_answer = bool(re.search(r'\[ANSWER\]\s*-?\d+', new_text, re.IGNORECASE))
+
+        if not tool_calls or has_answer:
             # No tool calls - we're done
             all_text += new_text
             turns.append(Turn(
