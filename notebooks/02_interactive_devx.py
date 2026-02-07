@@ -166,14 +166,14 @@ def _(mo):
 
 @app.cell
 def _(this_host):
-    import os
+    import os as _os
     from monarch.spmd import SPMDActor
 
-    GPUS_PER_HOST = 4
-    TRAIN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train.py")
+    _GPUS_PER_HOST = 4
+    _TRAIN_SCRIPT = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "train.py")
 
     # Spawn processes on the local host
-    local_proc_mesh = this_host().spawn_procs(per_host={"gpus": GPUS_PER_HOST})
+    local_proc_mesh = this_host().spawn_procs(per_host={"gpus": _GPUS_PER_HOST})
 
     # Spawn SPMDActor — it configures torch elastic env vars automatically
     spmd_actors = local_proc_mesh.spawn("_SPMDActor", SPMDActor)
@@ -185,7 +185,7 @@ def _(this_host):
     )
 
     # Execute training script across all processes
-    spmd_actors.main.call(master_addr, master_port, [TRAIN_SCRIPT]).get()
+    spmd_actors.main.call(master_addr, master_port, [_TRAIN_SCRIPT]).get()
 
     print("DDP training completed!")
     return
@@ -210,19 +210,19 @@ def _(mo):
 
 @app.cell
 def _():
-    import os
+    import os as _os
     from monarch.job.spmd import serve
 
-    GPUS_PER_HOST = 4
-    TRAIN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train.py")
+    _GPUS_PER_HOST = 4
+    _TRAIN_SCRIPT = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "train.py")
 
     # serve() allocates hosts and launches workers (slow, one time)
     job = serve(
         [
             "torchrun",
-            f"--nproc-per-node={GPUS_PER_HOST}",
+            f"--nproc-per-node={_GPUS_PER_HOST}",
             "--standalone",
-            TRAIN_SCRIPT,
+            _TRAIN_SCRIPT,
         ],
         scheduler="local_cwd",
     )

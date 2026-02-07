@@ -16,9 +16,6 @@ Run with: uv run marimo edit notebooks/07_async_rl_e2e.py
 
 # CRITICAL: Set allocator config BEFORE any PyTorch imports (including in subprocesses)
 # Set both names for compatibility (old and new PyTorch versions)
-import os as _os
-_os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-_os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import marimo
 
@@ -26,14 +23,12 @@ __generated_with = "0.19.7"
 app = marimo.App(width="medium")
 
 
-# Cell 1: marimo import
 @app.cell
 def _():
     import marimo as mo
     return (mo,)
 
 
-# Cell 2: Environment setup
 @app.cell
 def _():
     # Environment setup for Monarch subprocesses
@@ -55,7 +50,6 @@ def _():
     return
 
 
-# Cell 3: Title + intro with NB01-03 back-references
 @app.cell
 def _(mo):
     mo.md(r"""
@@ -79,7 +73,6 @@ def _(mo):
     return
 
 
-# Cell 4: Core imports
 @app.cell
 def _():
     from collections import deque
@@ -124,16 +117,14 @@ def _():
     )
 
 
-# Cell 5: Monarch actor imports
 @app.cell
 def _():
     from monarch.actor import Actor, endpoint, current_rank
     return Actor, current_rank, endpoint
 
 
-# Cell 6: Display Trajectory/TrainMetrics fields
 @app.cell
-def _(Trajectory, TrainMetrics, mo):
+def _(TrainMetrics, Trajectory, mo):
     import dataclasses as _dc
     _traj_fields = [(f.name, f.type.__name__ if hasattr(f.type, '__name__') else str(f.type)) for f in _dc.fields(Trajectory)]
     _metrics_fields = [(f.name, f.type.__name__ if hasattr(f.type, '__name__') else str(f.type)) for f in _dc.fields(TrainMetrics)]
@@ -159,7 +150,6 @@ def _(Trajectory, TrainMetrics, mo):
     return
 
 
-# Cell 7: Service infrastructure (relabeled)
 @app.cell
 def _(mo):
     mo.md(r"""
@@ -175,20 +165,18 @@ def _(mo):
     return
 
 
-# Cell 8: Service imports
 @app.cell
 def _():
     from monarch_utils.services import Service, register_service
     return Service, register_service
 
 
-# Cell 9: setup() vs __init__ explanation
 @app.cell
 def _(mo):
     mo.md(r"""
     ## The `setup()` Pattern
 
-    Monarch actors use a two-phase initialization:
+    Actors in this notebook use a two-phase initialization:
 
     1. **`__init__`** runs during `spawn()` -- keep it lightweight (store config, set rank)
     2. **`setup()`** is an endpoint called explicitly after spawn -- do heavy work here
@@ -208,7 +196,6 @@ def _(mo):
     return
 
 
-# Cell 10: ZorplexWorker explanation
 @app.cell
 def _(mo):
     mo.md(r"""
@@ -227,7 +214,6 @@ def _(mo):
     return
 
 
-# Cell 11: ZorplexWorker actor
 @app.cell
 def _(Actor, current_rank, endpoint, get_spec):
     class ZorplexWorker(Actor):
@@ -279,7 +265,6 @@ def _(Actor, current_rank, endpoint, get_spec):
     return (ZorplexWorker,)
 
 
-# Cell 12: ReplayBuffer explanation
 @app.cell
 def _(mo):
     mo.md(r"""
@@ -289,19 +274,15 @@ def _(mo):
     the trainer samples batches out. The `clear()` endpoint lets us reset between
     sync and async runs for a fair comparison.
 
-    **Why a buffer?** Without it, the trainer would train on each trajectory
-    immediately after it's generated -- consecutive samples from the same generator
-    are highly correlated (same policy, similar tasks). Random sampling from a buffer
-    decorrelates the training data, giving better gradient estimates. This is the same
-    principle behind experience replay in DQN and other off-policy methods.
-
-    The buffer also enables async RL: generation and training happen independently,
-    connected only through the buffer.
+    Recall our intro to async RL in notebook 4 -- the replay buffer is the decoupling
+    point that enables asynchronous execution. Generators push, trainer pulls, neither
+    waits for the other. A secondary benefit is decorrelation: random sampling breaks
+    the correlation between consecutive trajectories from the same generator, giving
+    better gradient estimates (especially when mixing tasks of different difficulties).
     """)
     return
 
 
-# Cell 13: ReplayBuffer actor (with clear() endpoint)
 @app.cell
 def _(Actor, Trajectory, deque, endpoint, random):
     class ReplayBuffer(Actor):
@@ -351,58 +332,39 @@ def _(Actor, Trajectory, deque, endpoint, random):
     return (ReplayBuffer,)
 
 
-# Cell 14: TrainerActor explanation (REINFORCE formula, circular buffer, CPU staging)
 @app.cell
 def _(mo):
     mo.md(r"""
     ## Actor 3: TrainerActor
 
     The trainer loads the model, receives batches of trajectories, and computes
-    REINFORCE updates.
+    policy gradient updates. We use **REINFORCE** -- the simplest policy gradient
+    method. Production systems typically use PPO or GRPO, which are variations that improve
+    stability, but the approach looks similar from a systems perspective. In other words,
+    REINFORCE lets us focus on the *system* (actors, weight sync, async coordination) rather
+    than the algorithm.
 
-    **REINFORCE**: For each trajectory, we compute per-token log-probabilities on
-    the *response tokens only* (using `model_only_text`, not the full text with
-    injected tool results). The loss is:
-
+    The loss for each trajectory is:
     ```
-    loss = -sum(log_prob(token_i)) * (reward - baseline)
+    loss = -sum(log_prob(response_token_i)) * (reward - baseline)
     ```
 
-    This weights the entire response by the advantage. Positive advantage reinforces
-    the response; negative advantage suppresses it.
+    Each trajectory carries pre-tokenized `input_ids` and a `prompt_length` boundary
+    from the generator, so the trainer never needs to re-tokenize or reconstruct
+    the prompt -- it computes log-probs on response tokens starting at `prompt_length`.
 
-    The **baseline** is an exponential moving average (EMA) of past rewards:
-    `baseline = 0.9 * baseline + 0.1 * avg_reward`. This reduces gradient variance
-    without introducing bias -- the baseline shifts the advantage up or down but
-    doesn't change the direction of the gradient in expectation.
-
-    **Approximation note:** In a multi-turn tool-use setting, `model_only_text`
-    concatenates the model's generated tokens across turns *without* the injected
-    tool results. This means the model sees a different context during training
-    (prompt + model text) than during generation (prompt + model text + tool results
-    interleaved). The log-probabilities are therefore computed under a slightly
-    different distribution than the one that produced the trajectory. This is a
-    known approximation -- full-fidelity training would reconstruct the exact
-    multi-turn conversation, but that adds significant complexity. For a pedagogical
-    notebook, the approximation is acceptable and the gradient signal still points
-    in the right direction.
-
-    **Circular buffer with CPU staging** (from NB06): Instead of registering RDMA
-    handles directly on GPU parameters (which blocks training during reads), we
-    maintain N CPU staging slots. After each training step, weights are copied
-    GPU -> CPU (D2H) into the current slot. Generators read from CPU via RDMA,
-    then copy to their own GPU (H2D). The data flow:
+    **Circular buffer with CPU staging** (from NB06): After each training step,
+    weights are copied GPU -> CPU into a circular buffer slot. Generators read
+    from CPU via RDMA, then copy to their own GPU. This decouples training from
+    weight distribution.
 
     ```
     Trainer GPU --D2H--> CPU slot[v % 3] --RDMA--> Generator CPU staging --H2D--> Generator GPU
     ```
-
-    This decouples training from weight distribution.
     """)
     return
 
 
-# Cell 15: TrainerActor (fixed REINFORCE, circular buffer with CPU staging)
 @app.cell
 def _(
     Actor,
@@ -469,24 +431,14 @@ def _(
 
             self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr)
 
-            # Store system prompt for log-prob computation in train_step
-            self.spec = get_spec("compositional", seed=42)
-            self._system_prompt = self.spec.get_system_prompt(with_hint=True)
-
             # --- Circular buffer with CPU staging ---
-            # Compute total bytes for all parameters
             total_bytes = sum(p.numel() * p.element_size() for p in self.model.parameters())
 
-            # Create N CPU slots for weight staging
-            # Note: we use regular (non-pinned) CPU memory here because
-            # pin_memory=True triggers dmabuf MR registration in the RDMA
-            # subsystem, which can fail on some host configurations.
             self._slots = [
                 torch.empty(total_bytes, dtype=torch.uint8)
                 for _ in range(self.n_buffer_slots)
             ]
 
-            # Register each slot with RDMA (if available)
             self._slot_handles = []
             if rdma_available() and RDMABuffer is not None:
                 try:
@@ -497,14 +449,12 @@ def _(
                     print(f"[Trainer:{self.rank}] RDMA registration failed: {e}")
                     self._slot_handles = []
 
-            # Store parameter metadata for scatter on generator side
             self._param_meta = {}
             offset = 0
             for name, p in self.model.named_parameters():
                 self._param_meta[name] = (offset, tuple(p.shape), p.dtype)
                 offset += p.numel() * p.element_size()
 
-            # Publish initial weights to slot 0
             self._publish_weights()
 
             self._ready = True
@@ -558,11 +508,8 @@ def _(
         def train_step(self, trajectories: list[Trajectory], baseline: float) -> TrainMetrics:
             """Train on a batch of trajectories using REINFORCE.
 
-            For each trajectory:
-            1. Reconstruct the prompt using the system prompt + task question
-            2. Tokenize prompt to find the boundary
-            3. Compute per-token log-probs on response tokens only (model_only_text)
-            4. Weight by advantage (reward - baseline)
+            Each trajectory carries pre-tokenized input_ids and a prompt_length
+            boundary from the generator, so we just slice and compute log-probs.
             """
             if len(trajectories) == 0:
                 return TrainMetrics(
@@ -577,32 +524,12 @@ def _(
             valid_count = 0
 
             for traj in trajectories:
-                # Reconstruct prompt using system prompt + task question
-                messages = [
-                    {"role": "system", "content": self._system_prompt},
-                    {"role": "user", "content": traj.task_question},
-                ]
-                prompt_text = self.tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
+                if not traj.input_ids or traj.prompt_length == 0:
+                    continue
 
-                # Tokenize prompt to find boundary
-                prompt_ids = self.tokenizer(
-                    prompt_text, return_tensors="pt", add_special_tokens=False
-                )["input_ids"]
-                prompt_len = prompt_ids.shape[1]
-
-                # Use model_only_text if available, fall back to response_text
-                response = traj.model_only_text if traj.model_only_text else traj.response_text
-
-                # Tokenize prompt + response together
-                full_ids = self.tokenizer(
-                    prompt_text + response,
-                    return_tensors="pt",
-                    add_special_tokens=False,
-                    truncation=True,
-                    max_length=1024,
-                )["input_ids"].to(self.device)
+                # Use pre-tokenized sequence from the generator
+                full_ids = torch.tensor(traj.input_ids, device=self.device).unsqueeze(0)
+                prompt_len = traj.prompt_length
 
                 if full_ids.shape[1] <= prompt_len + 1:
                     continue
@@ -630,11 +557,7 @@ def _(
                 avg_loss = torch.tensor(0.0)
 
             # Bump version, then publish weights to the new slot.
-            # _publish_weights() uses policy_version % n_buffer_slots to pick the
-            # slot, so incrementing first ensures new weights go to a fresh slot.
-            # get_weight_handle() uses the same index, so it returns the right handle.
-            # This is safe because Monarch actors process endpoints sequentially --
-            # no concurrent get_weight_handle() call can see a mid-write slot.
+            # Safe because Monarch actors process endpoints sequentially.
             self.policy_version += 1
             self._publish_weights()
             self.train_steps += 1
@@ -653,6 +576,7 @@ def _(
         def evaluate_zorplex(self, num_samples: int = 10, seed: int = 42) -> dict:
             """Evaluate current model on compositional Zorplex tasks."""
             self.model.eval()
+            torch.manual_seed(seed)  # Deterministic evaluation
             spec = get_spec("compositional", seed=seed)
             correct = 0
             total_turns = 0
@@ -662,6 +586,7 @@ def _(
                 result = generate_with_tools(
                     self.model, self.tokenizer, spec, task,
                     self.device, max_turns=5,
+                    temperature=0.0, do_sample=False,
                 )
                 correct += int(result.is_correct)
                 total_turns += len(result.turns)
@@ -676,61 +601,45 @@ def _(
     return (TrainerActor,)
 
 
-# Cell 15b: Understanding train_step
 @app.cell
 def _(mo):
     mo.md(r"""
     ### How `train_step` Works
 
-    The REINFORCE implementation above does the following for each trajectory in the batch:
+    Each trajectory arrives with pre-tokenized `input_ids` and a `prompt_length`
+    boundary (computed by the generator at generation time). The trainer:
 
-    1. **Reconstruct the prompt**: Build `[system, user]` messages, apply the chat template
-       to get the exact prompt string the model would see.
-    2. **Find the prompt boundary**: Tokenize the prompt alone to get `prompt_len` --
-       everything after this position is response tokens.
-    3. **Compute log-probs**: Run the full sequence (prompt + response) through the model.
-       Extract logits starting at `prompt_len - 1` (because `logits[i]` predicts `token[i+1]`).
-       Apply `log_softmax` and `gather` to get the log-probability of each actual response token.
-    4. **Compute loss**: `loss = -sum(log_probs) * advantage` where `advantage = reward - baseline`.
-       Positive advantage (correct answer) reinforces the response; negative suppresses it.
-       Note: we use `sum` over tokens, not `mean`, so longer responses contribute more
-       gradient. This is a common simplification; production systems often normalize by
-       sequence length.
-    5. **Accumulate and step**: Collect per-trajectory losses into a list, sum and average,
-       then call `backward()` and `optimizer.step()` once for the whole batch.
-
-    After the optimizer step, `policy_version` is incremented and then
-    `_publish_weights()` copies the updated parameters to the circular buffer
-    (GPU -> CPU) at slot `version % 3`. This ordering is safe because Monarch actors
-    are single-threaded -- no concurrent `get_weight_handle()` call can see a
-    partially-written slot.
+    1. **Loads the token sequence** directly from `traj.input_ids` -- no re-tokenization.
+    2. **Slices at `prompt_length`** to separate prompt from response tokens.
+    3. **Computes log-probs** on response tokens only (`logits[i]` predicts `token[i+1]`,
+       so we start at `prompt_length - 1`).
+    4. **Computes loss**: `loss = -sum(log_probs) * advantage` where
+       `advantage = reward - baseline`. Positive advantage reinforces the response.
+    5. **Steps the optimizer** once for the whole batch, then publishes new weights
+       to the circular buffer.
     """)
     return
 
 
-# Cell 16: GeneratorWorker explanation
 @app.cell
 def _(mo):
     mo.md(r"""
     ## Actor 4: GeneratorWorker
 
-    Each generator loads its own copy of the model and runs inference independently.
-    Weight sync uses the circular buffer pattern:
+    Each generator loads its own copy of the model, generates its own tasks from
+    its seeded spec, and runs inference independently. The key endpoint is
+    `generate_trajectory()` -- it generates a task, runs multi-turn inference
+    with tool execution, and returns a complete `Trajectory` with pre-tokenized
+    `input_ids` and `prompt_length` for the trainer.
 
-    1. Generator calls `trainer.get_weight_handle()` to get the RDMA handle + metadata
-    2. A single RDMA read pulls the entire contiguous buffer into a pre-allocated
-       CPU staging buffer
-    3. The generator scatters from CPU staging into GPU model params (H2D)
-
-    This avoids the RDMA API's internal temporary copy (which happens when the
-    destination is a GPU tensor) and gives explicit control over timing.
-
+    Weight sync uses the pattern from NB06: the trainer publishes weights to CPU
+    slots (circular buffer), and generators read via RDMA directly into their GPU
+    parameters -- no CPU staging on the generator side.
     Fallback path (`sync_weights` using `state_dict`) stays for when RDMA is unavailable.
     """)
     return
 
 
-# Cell 17: GeneratorWorker (RDMA batching, CPU staging sync)
 @app.cell
 def _(
     Actor,
@@ -793,8 +702,7 @@ def _(
 
             self.spec = get_spec("compositional", difficulty=self.difficulty, seed=42 + self.rank)
 
-            # Pre-allocate CPU staging buffer for weight sync (sized during first sync)
-            self._staging_buf = None
+            self._sync_buf = None  # Contiguous GPU buffer for RDMA weight sync
 
             self._ready = True
             print(f"[GeneratorWorker:{self.rank}] Ready on GPU {gpu_id}!")
@@ -809,24 +717,26 @@ def _(
         def sync_weights_from_buffer(self, handle, param_meta: dict, version: int, total_bytes: int) -> bool:
             """Sync weights via RDMA from trainer's circular buffer.
 
-            Flow: Trainer CPU slot --RDMA--> Generator CPU staging --H2D--> Generator GPU
+            Reads into a contiguous GPU buffer, then scatters into model params.
+            Flow: Trainer CPU slot --RDMA--> Generator GPU buffer --scatter--> Generator GPU params
             """
             if version <= self.policy_version:
                 return False
 
-            # Allocate staging buffer on first sync (reuse for subsequent syncs)
-            if self._staging_buf is None or self._staging_buf.numel() < total_bytes:
-                self._staging_buf = torch.empty(total_bytes, dtype=torch.uint8)
+            # Allocate contiguous GPU buffer on first sync (reuse thereafter)
+            if self._sync_buf is None or self._sync_buf.numel() < total_bytes:
+                self._sync_buf = torch.empty(total_bytes, dtype=torch.uint8, device=self.device)
 
-            # RDMA read: trainer CPU memory -> generator CPU memory
-            handle.read_into(self._staging_buf[:total_bytes]).get()
+            # RDMA read: trainer CPU slot -> generator GPU buffer
+            byte_view = self._sync_buf[:total_bytes].flatten()
+            handle.read_into(byte_view).get()
 
-            # Scatter from CPU staging buffer into GPU model params (H2D)
+            # Scatter from contiguous GPU buffer into model params (GPU->GPU, fast)
             for name, p in self.model.named_parameters():
                 off, shape, dtype = param_meta[name]
                 nbytes = p.numel() * p.element_size()
-                src = self._staging_buf[off:off + nbytes].view(dtype).view(shape)
-                p.data.copy_(src)  # H2D copy (src is CPU, p.data is on self.device)
+                src = self._sync_buf[off:off + nbytes].view(dtype).view(shape)
+                p.data.copy_(src)
             self.policy_version = version
             return True
 
@@ -841,11 +751,24 @@ def _(
 
         @endpoint
         def generate(self, question: str, answer: int, max_turns: int = 5) -> Trajectory:
-            """Generate a trajectory for the given task."""
+            """Generate a trajectory for a given task (used for examples/debugging)."""
             self.model.eval()
-
             task = Task(question=question, correct_answer=answer, metadata={})
+            return self._run_generation(task, max_turns)
 
+        @endpoint
+        def generate_trajectory(self, max_turns: int = 5) -> Trajectory:
+            """Generate a trajectory using a self-generated task.
+
+            Each generator has its own seeded spec, so broadcasting this endpoint
+            to all generators produces diverse trajectories from different tasks.
+            """
+            self.model.eval()
+            task = self.spec.generate_task()
+            return self._run_generation(task, max_turns)
+
+        def _run_generation(self, task: Task, max_turns: int) -> Trajectory:
+            """Shared generation logic: run inference, compute tokens, return Trajectory."""
             result = generate_with_tools(
                 self.model, self.tokenizer, self.spec, task, self.device,
                 max_turns=max_turns, max_tokens_per_turn=150,
@@ -855,6 +778,27 @@ def _(
 
             # Build model-only text (generated tokens without injected tool results)
             model_only_text = "".join(t.generated_text for t in result.turns)
+
+            # Pre-tokenize for the trainer: prompt + model_only_text
+            messages = [
+                {"role": "system", "content": self.spec.get_system_prompt(with_hint=True)},
+                {"role": "user", "content": task.question},
+            ]
+            prompt_text = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            prompt_ids = self.tokenizer(
+                prompt_text, return_tensors="pt", add_special_tokens=False
+            )["input_ids"]
+            prompt_length = prompt_ids.shape[1]
+
+            full_ids = self.tokenizer(
+                prompt_text + model_only_text,
+                return_tensors="pt",
+                add_special_tokens=False,
+                truncation=True,
+                max_length=1024,
+            )["input_ids"]
 
             return Trajectory(
                 task_question=task.question,
@@ -867,11 +811,12 @@ def _(
                 generator_id=self.rank,
                 policy_version=self.policy_version,
                 model_only_text=model_only_text,
+                input_ids=full_ids[0].tolist(),
+                prompt_length=prompt_length,
             )
     return (GeneratorWorker,)
 
 
-# Cell 18: Architecture diagram + single-controller back-reference
 @app.cell
 def _(mo):
     mo.md(r"""
@@ -882,30 +827,33 @@ def _(mo):
     everything, but actors do the heavy lifting on their own GPUs.
 
     ```
-    ┌─────────────────────┐                    ┌─────────────────────┐
-    │  ZorplexService     │                    │  GeneratorWorkers   │
-    │  ┌───────────────┐  │     tasks          │  ┌───────────────┐  │
-    │  │ ZorplexWorker │  │ ─────────────────> │  │ GenWorker 0   │  │
-    │  │ ZorplexWorker │  │                    │  │ GenWorker 1   │  │
-    │  └───────────────┘  │                    │  └───────────────┘  │
-    └─────────────────────┘                    └──────────┬──────────┘
-                                                          │ trajectories
-                                                          v
-                                               ┌─────────────────────┐
-                                               │    ReplayBuffer     │
-                                               └──────────┬──────────┘
-                                                          │ sample batch
-                                                          v
-                                               ┌─────────────────────┐
-                                               │      Trainer        │
-                                               │  (circular buffer)  │──> RDMA weight sync
-                                               └─────────────────────┘      to GenWorkers
+    ┌─────────────────────┐
+    │  GeneratorMesh      │  (ActorMesh -- each generates its own tasks)
+    │  ┌───────────────┐  │
+    │  │ Generator 0   │  │──┐
+    │  │ Generator 1   │  │──┤ trajectories
+    │  └───────────────┘  │  │
+    └─────────────────────┘  │
+                             v
+                  ┌─────────────────────┐
+                  │    ReplayBuffer     │
+                  └──────────┬──────────┘
+                             │ sample batch
+                             v
+                  ┌─────────────────────┐
+                  │      Trainer        │
+                  │  (circular buffer)  │──> RDMA weight sync
+                  └─────────────────────┘      to GeneratorMesh
     ```
+
+    Generators are a plain **ActorMesh** -- we address them directly via `.call()`
+    (broadcast to all) or `.slice()` (individual access). ZorplexWorkers (not shown)
+    are wrapped in a **Service** (NB05) for health tracking and round-robin routing,
+    but generators don't need that overhead since we control them directly.
     """)
     return
 
 
-# Cell 19a: Sync vs Async explanation
 @app.cell
 def _(mo):
     mo.md(r"""
@@ -938,7 +886,6 @@ def _(mo):
     return
 
 
-# Cell 19b: Policy staleness trade-off
 @app.cell
 def _(mo):
     mo.md(r"""
@@ -961,7 +908,6 @@ def _(mo):
     return
 
 
-# Cell 20: Configuration sliders
 @app.cell
 def _(mo):
     num_steps_slider = mo.ui.slider(3, 20, value=5, label="Training steps")
@@ -994,7 +940,6 @@ def _(mo):
     return batch_size_slider, num_generators_slider, num_steps_slider
 
 
-# Cell 21a: Timing dataclasses
 @app.cell
 def _():
     import threading
@@ -1030,16 +975,9 @@ def _():
         @property
         def steps_per_second(self) -> float:
             return self.num_steps / self.wall_time if self.wall_time > 0 else 0
-    return (
-        TimingEvent,
-        TimingStats,
-        field,
-        threading,
-        time,
-    )
+    return TimingEvent, TimingStats, threading, time
 
 
-# Cell 21b: Setup choreography explanation
 @app.cell
 def _(mo):
     mo.md(r"""
@@ -1048,20 +986,22 @@ def _(mo):
     This is the **single-controller paradigm** in action. The notebook process
     orchestrates a careful initialization sequence:
 
-    1. Spawn ZorplexWorkers (CPU-only, lightweight -- ready immediately)
-    2. Spawn GeneratorWorkers, then call `setup()` on each (loads model onto its GPU)
+    1. Spawn ZorplexWorkers via a **Service** (NB05 pattern -- health tracking, round-robin)
+    2. Spawn GeneratorWorkers as a plain **ActorMesh** and call `setup()` on all via
+       `.call()` broadcast (loads model onto each GPU)
     3. Spawn ReplayBuffer (CPU-only, ready immediately)
     4. Spawn Trainer, then call `setup()` (loads model onto GPU 0, registers RDMA buffers)
-    5. Register services for routing
 
-    The ordering matters: the trainer must be ready before the async loop starts,
-    because generators need to sync weights from it. Each `setup().call_one().get()`
-    blocks until that actor confirms it's ready.
+    **Why a Service for ZorplexWorkers but not generators?** ZorplexWorkers are
+    stateless -- any worker can handle any request, so round-robin routing is natural.
+    Generators have individual identity (own GPU, own model copy, own policy version),
+    so we address them directly via the mesh. In production, you might add Service
+    wrapping for generators too (for health tracking and auto-scaling), but here it
+    would just be overhead.
     """)
     return
 
 
-# Cell 21c: Configuration constants + setup_actors
 @app.cell
 def _(
     GeneratorWorker,
@@ -1085,7 +1025,8 @@ def _(
         """Spawn and initialize all actors. Returns them for reuse."""
         host = this_host()
 
-        # 1. ZorplexWorkers -- Service spawns workers internally
+        # 1. ZorplexWorkers -- wrapped in a Service (NB05 pattern) for
+        #    health tracking and round-robin routing
         zorplex_worker_procs = host.spawn_procs(per_host={"procs": NUM_ZORPLEX})
         zorplex_svc_procs = host.spawn_procs(per_host={"procs": 1})
         zorplex_svc = zorplex_svc_procs.spawn("zorplex_svc", Service,
@@ -1093,12 +1034,11 @@ def _(
             procs=zorplex_worker_procs, procs_per_replica=1,
             difficulty="easy")
 
-        # 2. GeneratorWorkers -- spawned directly (no Service wrapper for individual access)
-        gen_worker_procs = host.spawn_procs(per_host={"procs": NUM_GENERATORS})
-        gen_svc_procs = host.spawn_procs(per_host={"procs": 1})
-        gen_svc = gen_svc_procs.spawn("gen_svc", Service,
-            service_name="generators", worker_class=GeneratorWorker,
-            procs=gen_worker_procs, procs_per_replica=1)
+        # 2. Generators -- plain ActorMesh (no Service wrapper).
+        #    Each generator has its own GPU and model copy; we address them
+        #    via .call() broadcast or .slice() for individual access.
+        gen_procs = host.spawn_procs(per_host={"procs": NUM_GENERATORS})
+        generators = gen_procs.spawn("generators", GeneratorWorker)
 
         # 3. ReplayBuffer
         buffer_procs = host.spawn_procs(per_host={"procs": 1})
@@ -1112,42 +1052,28 @@ def _(
         zorplex_svc.ping.call_one().get()
 
         print("[SETUP] Setting up generator workers...")
-        gen_worker_list = gen_svc.get_all_replicas.call_one().get()
-        for w in gen_worker_list:
-            w.setup.call_one().get()
+        generators.setup.call().get()  # broadcast setup to all generators
 
-        gen_svc.ping.call_one().get()
         buffer.stats.call_one().get()
 
         print("[SETUP] Setting up trainer...")
         trainer.setup.call_one().get()
 
         register_service("zorplex", zorplex_svc)
-        register_service("generators", gen_svc)
 
         print(f"[SETUP] All actors ready! {NUM_GENERATORS} generators, {NUM_ZORPLEX} zorplex workers")
 
         return {
             "trainer": trainer,
             "buffer": buffer,
-            "gen_worker_list": gen_worker_list,
-            "gen_svc": gen_svc,
+            "generators": generators,
             "zorplex_svc": zorplex_svc,
         }
 
     actors = setup_actors()
-    return (
-        BATCH_SIZE,
-        NUM_GENERATORS,
-        NUM_STEPS,
-        NUM_ZORPLEX,
-        actors,
-        setup_actors,
-        this_host,
-    )
+    return BATCH_SIZE, NUM_GENERATORS, NUM_STEPS, actors
 
 
-# Cell 22: "Before Training: Zorplex Baseline"
 @app.cell
 def _(mo):
     mo.md(r"""
@@ -1160,7 +1086,6 @@ def _(mo):
     return
 
 
-# Cell 23: Pre-training evaluation
 @app.cell
 def _(actors, mo):
     print("Evaluating pre-training baseline...")
@@ -1180,16 +1105,11 @@ def _(actors, mo):
     return (pre_eval,)
 
 
-# Cell 23b: Example trajectory -- what a generation looks like
 @app.cell
 def _(actors, mo):
     # Generate one example trajectory so the reader can see what the pipeline produces
-    _zorplex_svc = actors["zorplex_svc"]
-    _gen = actors["gen_worker_list"][0]
-
-    _zw, _ = _zorplex_svc.get_replica_with_idx.call_one().get()
-    _q, _a = _zw.generate_task.call_one().get()
-    _example_traj = _gen.generate.call_one(_q, _a).get()
+    _gen = actors["generators"].slice(procs=0)
+    _example_traj = _gen.generate_trajectory.call_one().get()
 
     _status = "Correct" if _example_traj.is_correct else "Wrong"
     _reward = _example_traj.reward
@@ -1224,29 +1144,37 @@ def _(actors, mo):
     return
 
 
-# Cell 24: run_sync_loop (uses ALL generators sequentially)
 @app.cell
-def _(BATCH_SIZE, NUM_STEPS, TimingEvent, TimingStats, actors, time):
+def _(
+    BATCH_SIZE,
+    NUM_GENERATORS,
+    NUM_STEPS,
+    TimingEvent,
+    TimingStats,
+    actors,
+    time,
+):
     def run_sync_loop() -> TimingStats:
         """
-        SYNC MODE: Rotate through ALL generators sequentially.
-        Pattern: generate -> train -> generate -> train ...
+        SYNC MODE: Broadcast generate to all generators, then train.
+        Pattern: generate batch -> train -> generate batch -> train ...
 
-        Uses all generators in round-robin so the comparison with async
-        is fair -- same number of generators, just used sequentially.
+        Uses .call() to broadcast generate_trajectory to all generators
+        simultaneously. Each generator produces a different trajectory
+        (different seed, stochastic sampling), but the call is synchronous --
+        we wait for ALL generators to finish before training.
         """
         print("\n" + "=" * 60)
-        print("SYNC MODE: Sequential Generate -> Train")
+        print("SYNC MODE: Broadcast Generate -> Train")
         print("=" * 60)
 
         trainer = actors["trainer"]
         buffer = actors["buffer"]
-        gen_worker_list = actors["gen_worker_list"]
-        zorplex_svc = actors["zorplex_svc"]
+        generators = actors["generators"]
 
         stats = TimingStats(
             mode="SYNC",
-            num_generators=len(gen_worker_list),
+            num_generators=NUM_GENERATORS,
             num_steps=NUM_STEPS,
             total_generations=0,
             wall_time=0,
@@ -1256,24 +1184,26 @@ def _(BATCH_SIZE, NUM_STEPS, TimingEvent, TimingStats, actors, time):
         t0 = time.perf_counter()
 
         for step in range(NUM_STEPS):
-            # Rotate through ALL generators (fair comparison with async)
-            gen_worker = gen_worker_list[step % len(gen_worker_list)]
-
-            # Generate ONE trajectory (blocking)
+            # Generate trajectories -- broadcast to ALL generators
             gen_start = time.perf_counter()
-            zorplex_worker, _ = zorplex_svc.get_replica_with_idx.call_one().get()
-            question, answer = zorplex_worker.generate_task.call_one().get()
-            traj = gen_worker.generate.call_one(question, answer).get()
-            buffer.add.call_one(traj).get()
+            traj_mesh = generators.generate_trajectory.call().get()
+
+            # Collect trajectories into the buffer
+            for traj in traj_mesh.values():
+                buffer.add.call_one(traj).get()
+
             gen_time = time.perf_counter() - gen_start
             stats.gen_times.append(gen_time)
-            stats.total_generations += 1
-            stats.events.append(TimingEvent(
-                actor_id=f"Gen{step % len(gen_worker_list)}",
-                event_type="generate",
-                start_time=gen_start - t0,
-                duration=gen_time,
-            ))
+            stats.total_generations += NUM_GENERATORS
+
+            # Record one event per generator (they ran in parallel)
+            for gi in range(NUM_GENERATORS):
+                stats.events.append(TimingEvent(
+                    actor_id=f"Gen{gi}",
+                    event_type="generate",
+                    start_time=gen_start - t0,
+                    duration=gen_time,
+                ))
 
             # Train on buffer (blocking)
             train_start = time.perf_counter()
@@ -1282,23 +1212,16 @@ def _(BATCH_SIZE, NUM_STEPS, TimingEvent, TimingStats, actors, time):
                 metrics = trainer.train_step.call_one(batch, baseline).get()
                 baseline = 0.9 * baseline + 0.1 * metrics.avg_reward
 
-                # Sync updated weights to ALL generators (so they always
-                # generate with the latest policy -- truly synchronous RL)
+                # Sync weights to all generators (broadcast)
                 try:
                     handle, param_meta, version, total_bytes = trainer.get_weight_handle.call_one().get()
-
-                    # Fetch state dict once (not per-generator) for fallback path
-                    state_dict, ver = None, None
-                    if handle is None:
+                    if handle is not None:
+                        generators.sync_weights_from_buffer.call(handle, param_meta, version, total_bytes).get()
+                    else:
                         state_dict, ver = trainer.get_state_dict.call_one().get()
-
-                    for w in gen_worker_list:
-                        if handle is not None:
-                            w.sync_weights_from_buffer.call_one(handle, param_meta, version, total_bytes).get()
-                        else:
-                            w.sync_weights.call_one(state_dict, ver).get()
+                        generators.sync_weights.call(state_dict, ver).get()
                 except Exception:
-                    pass  # Non-fatal: generator will use slightly stale weights
+                    pass  # Non-fatal: generators will use slightly stale weights
 
             train_time = time.perf_counter() - train_start
             stats.train_times.append(train_time)
@@ -1309,38 +1232,46 @@ def _(BATCH_SIZE, NUM_STEPS, TimingEvent, TimingStats, actors, time):
                 duration=train_time,
             ))
 
-            status = "correct" if traj.is_correct else "wrong"
-            print(f"[SYNC {step + 1:2d}] {status} gen={gen_time * 1000:.0f}ms train={train_time * 1000:.0f}ms")
+            correct_count = sum(1 for t in traj_mesh.values() if t.is_correct)
+            print(f"[SYNC {step + 1:2d}] {correct_count}/{NUM_GENERATORS} correct "
+                  f"gen={gen_time * 1000:.0f}ms train={train_time * 1000:.0f}ms")
 
         stats.wall_time = time.perf_counter() - t0
         return stats
     return (run_sync_loop,)
 
 
-# Cell 25: run_async_loop (1 thread per generator, separate sync thread)
 @app.cell
-def _(BATCH_SIZE, NUM_STEPS, TimingEvent, TimingStats, actors, threading, time):
+def _(
+    BATCH_SIZE,
+    NUM_GENERATORS,
+    NUM_STEPS,
+    TimingEvent,
+    TimingStats,
+    actors,
+    threading,
+    time,
+):
     def run_async_loop() -> TimingStats:
         """
         ASYNC MODE: All generators running concurrently with trainer.
-        - 1 thread per generator (each runs its own generation loop)
-        - 1 separate weight sync thread
+        - 1 thread per generator (each uses .slice() to address its generator)
+        - 1 separate weight sync thread (broadcasts to all generators)
         - Training in main thread
 
         Uses try/except pattern from NB03 for fault tolerance in generation loops.
         """
         print("\n" + "=" * 60)
-        print(f"ASYNC MODE: {len(actors['gen_worker_list'])} Generators + 1 Trainer (Concurrent)")
+        print(f"ASYNC MODE: {NUM_GENERATORS} Generators + 1 Trainer (Concurrent)")
         print("=" * 60)
 
         trainer = actors["trainer"]
         buffer = actors["buffer"]
-        gen_worker_list = actors["gen_worker_list"]
-        zorplex_svc = actors["zorplex_svc"]
+        generators = actors["generators"]
 
         stats = TimingStats(
             mode="ASYNC",
-            num_generators=len(gen_worker_list),
+            num_generators=NUM_GENERATORS,
             num_steps=NUM_STEPS,
             total_generations=0,
             wall_time=0,
@@ -1350,16 +1281,15 @@ def _(BATCH_SIZE, NUM_STEPS, TimingEvent, TimingStats, actors, threading, time):
         stop_flag = threading.Event()
         t0 = time.perf_counter()
 
-        def generation_loop(gen_idx, gen_worker):
-            """Each generator gets its own thread."""
+        def generation_loop(gen_idx):
+            """Each generator gets its own thread, using .slice() for individual access."""
+            gen = generators.slice(procs=gen_idx)
             while not stop_flag.is_set():
                 gen_start = time.perf_counter()
 
-                zorplex_worker, _ = zorplex_svc.get_replica_with_idx.call_one().get()
-                question, answer = zorplex_worker.generate_task.call_one().get()
-
                 try:
-                    traj = gen_worker.generate.call_one(question, answer).get()
+                    # Self-generating: each generator produces its own task
+                    traj = gen.generate_trajectory.call_one().get()
                     buffer.add.call_one(traj).get()
 
                     gen_time = time.perf_counter() - gen_start
@@ -1383,7 +1313,7 @@ def _(BATCH_SIZE, NUM_STEPS, TimingEvent, TimingStats, actors, threading, time):
                     continue
 
         def weight_sync_loop():
-            """Periodically sync weights to all generators."""
+            """Periodically sync weights to all generators via broadcast."""
             while not stop_flag.is_set():
                 time.sleep(0.5)  # Sync every 500ms
                 if stop_flag.is_set():
@@ -1393,25 +1323,21 @@ def _(BATCH_SIZE, NUM_STEPS, TimingEvent, TimingStats, actors, threading, time):
                 try:
                     handle, param_meta, version, total_bytes = trainer.get_weight_handle.call_one().get()
 
-                    # Fetch state dict once (not per-generator) for fallback path
-                    state_dict, ver = None, None
-                    if handle is None:
+                    if handle is not None:
+                        # Broadcast RDMA sync to all generators
+                        results = generators.sync_weights_from_buffer.call(
+                            handle, param_meta, version, total_bytes
+                        ).get()
+                        synced_count = sum(1 for v in results.values() if v)
+                        with lock:
+                            stats.rdma_syncs += synced_count
+                    else:
+                        # Fallback: broadcast state_dict sync
                         state_dict, ver = trainer.get_state_dict.call_one().get()
-
-                    for w in gen_worker_list:
-                        try:
-                            if handle is not None:
-                                synced = w.sync_weights_from_buffer.call_one(handle, param_meta, version, total_bytes).get()
-                                if synced:
-                                    with lock:
-                                        stats.rdma_syncs += 1
-                            else:
-                                synced = w.sync_weights.call_one(state_dict, ver).get()
-                                if synced:
-                                    with lock:
-                                        stats.direct_syncs += 1
-                        except Exception:
-                            pass
+                        results = generators.sync_weights.call(state_dict, ver).get()
+                        synced_count = sum(1 for v in results.values() if v)
+                        with lock:
+                            stats.direct_syncs += synced_count
 
                     sync_time = time.perf_counter() - sync_start
                     with lock:
@@ -1424,10 +1350,10 @@ def _(BATCH_SIZE, NUM_STEPS, TimingEvent, TimingStats, actors, threading, time):
                 except Exception:
                     pass
 
-        # Start 1 thread per generator
+        # Start 1 thread per generator, each using .slice() for its worker
         gen_threads = []
-        for idx, worker in enumerate(gen_worker_list):
-            t = threading.Thread(target=generation_loop, args=(idx, worker), daemon=True)
+        for idx in range(NUM_GENERATORS):
+            t = threading.Thread(target=generation_loop, args=(idx,), daemon=True)
             t.start()
             gen_threads.append(t)
 
@@ -1477,7 +1403,6 @@ def _(BATCH_SIZE, NUM_STEPS, TimingEvent, TimingStats, actors, threading, time):
     return (run_async_loop,)
 
 
-# Cell 26: Clear buffer between runs, execute sync loop
 @app.cell
 def _(actors, run_sync_loop):
     # Clear buffer to start fresh
@@ -1491,7 +1416,6 @@ def _(actors, run_sync_loop):
     return (sync_stats,)
 
 
-# Cell 27: Execute async loop
 @app.cell
 def _(actors, run_async_loop):
     # Clear buffer between runs for fair comparison
@@ -1505,7 +1429,6 @@ def _(actors, run_async_loop):
     return (async_stats,)
 
 
-# Cell 28: Comparison table + markdown
 @app.cell
 def _(async_stats, mo, sync_stats):
     def _build_comparison(sync_s, async_s) -> str:
@@ -1520,37 +1443,36 @@ def _(async_stats, mo, sync_stats):
         sync_type = f"{async_s.rdma_syncs} RDMA" if async_s.rdma_syncs > 0 else f"{async_s.direct_syncs} direct"
 
         return f"""
-## Sync vs Async Comparison
+    ## Sync vs Async Comparison
 
-| Metric | SYNC | ASYNC | Ratio |
-|--------|------|-------|-------|
-| Wall time | {sync_s.wall_time:.2f}s | {async_s.wall_time:.2f}s | **{speedup:.2f}x** speedup |
-| Generations | {sync_s.total_generations} | {async_s.total_generations} | {async_s.total_generations / max(sync_s.total_generations, 1):.1f}x |
-| Gens/second | {sync_s.gens_per_second:.2f} | {async_s.gens_per_second:.2f} | **{gen_ratio:.1f}x** throughput |
-| Avg gen time | {avg_sync_gen:.0f}ms | {avg_async_gen:.0f}ms | |
-| Avg train time | {avg_sync_train:.0f}ms | {avg_async_train:.0f}ms | |
-| Weight syncs | -- | {sync_type} | |
+    | Metric | SYNC | ASYNC | Ratio |
+    |--------|------|-------|-------|
+    | Wall time | {sync_s.wall_time:.2f}s | {async_s.wall_time:.2f}s | **{speedup:.2f}x** speedup |
+    | Generations | {sync_s.total_generations} | {async_s.total_generations} | {async_s.total_generations / max(sync_s.total_generations, 1):.1f}x |
+    | Gens/second | {sync_s.gens_per_second:.2f} | {async_s.gens_per_second:.2f} | **{gen_ratio:.1f}x** throughput |
+    | Avg gen time | {avg_sync_gen:.0f}ms | {avg_async_gen:.0f}ms | |
+    | Avg train time | {avg_sync_train:.0f}ms | {avg_async_train:.0f}ms | |
+    | Weight syncs | -- | {sync_type} | |
 
-### Key Observations
+    ### Key Observations
 
-- **Data throughput**: Async collected **{gen_ratio:.1f}x** more trajectories per second.
-  More data means better gradient estimates.
-- **GPU utilization**: In sync mode, the trainer GPU sits idle during generation and
-  vice versa. Async keeps both busy.
-- **Generators ran in parallel**: {async_s.num_generators} generators each had their own
-  thread, producing data independently.
-- The trainer consumed from the replay buffer continuously, never waiting for a specific
-  generator to finish.
+    - **Data throughput**: Async collected **{gen_ratio:.1f}x** more trajectories per second.
+      More data means better gradient estimates.
+    - **GPU utilization**: In sync mode, the trainer GPU sits idle during generation and
+      vice versa. Async keeps both busy.
+    - **Generators ran in parallel**: {async_s.num_generators} generators each had their own
+      thread, producing data independently.
+    - The trainer consumed from the replay buffer continuously, never waiting for a specific
+      generator to finish.
 
-In production with more generators, the throughput advantage grows further.
-"""
+    In production with more generators, the throughput advantage grows further.
+    """
 
     comparison_md = _build_comparison(sync_stats, async_stats)
     mo.md(comparison_md)
-    return (comparison_md,)
+    return
 
 
-# Cell 29: Timeline visualization (matplotlib Gantt charts)
 @app.cell
 def _(async_stats, mo, sync_stats):
     import matplotlib.pyplot as plt
@@ -1606,19 +1528,18 @@ def _(async_stats, mo, sync_stats):
     plt.tight_layout()
     mo.md("""### Timeline Visualization
 
-The Gantt charts below show what each actor was doing over time. In sync mode,
-bars are strictly sequential -- notice the gaps between generation and training bars.
-In async mode, generators and trainer overlap -- that overlap is where the throughput
-gain comes from.
+    The Gantt charts below show what each actor was doing over time. In sync mode,
+    bars are strictly sequential -- notice the gaps between generation and training bars.
+    In async mode, generators and trainer overlap -- that overlap is where the throughput
+    gain comes from.
 
-**Try this:** Look at the sync chart and count the idle gaps. Each gap is wasted GPU
-time. Then look at the async chart -- the trainer bar starts almost immediately because
-generators are pre-filling the buffer concurrently.
-""")
+    **Try this:** Look at the sync chart and count the idle gaps. Each gap is wasted GPU
+    time. Then look at the async chart -- the trainer bar starts almost immediately because
+    generators are pre-filling the buffer concurrently.
+    """)
     return
 
 
-# Cell 30: "After Training: Did It Improve?"
 @app.cell
 def _(mo):
     mo.md(r"""
@@ -1635,7 +1556,6 @@ def _(mo):
     return
 
 
-# Cell 31: Post-training evaluation
 @app.cell
 def _(actors):
     print("Evaluating post-training performance...")
@@ -1644,7 +1564,6 @@ def _(actors):
     return (post_eval,)
 
 
-# Cell 32: Before/after comparison display
 @app.cell
 def _(mo, post_eval, pre_eval):
     _acc_delta = post_eval["accuracy"] - pre_eval["accuracy"]
@@ -1668,7 +1587,6 @@ def _(mo, post_eval, pre_eval):
     return
 
 
-# Cell 33: What's happening under the hood (updated)
 @app.cell
 def _(mo):
     mo.md(r"""
@@ -1691,21 +1609,26 @@ def _(mo):
     - The circular buffer has 3 slots, so training never blocks on reads
 
     **Async concurrency** (via threads):
-    - 1 thread per generator, each running its own generation loop
-    - 1 weight sync thread, periodically pulling from trainer and pushing to generators
+    - 1 thread per generator, each using `.slice(procs=i)` to address its generator
+    - 1 weight sync thread, broadcasting to all generators via `.call()`
     - Training in the main thread
     - `threading.Event` coordinates shutdown when training completes
     - GIL is released during I/O (actor calls) and CUDA (GPU compute), so threads
       achieve real concurrency
 
+    **Sync vs Async generation**:
+    - Sync mode uses `.call()` broadcast to trigger all generators at once, then waits
+      for all to finish before training
+    - Async mode uses `.slice()` per thread so each generator runs independently --
+      no generator waits for another
+
     **Fault tolerance** (from NB03):
-    - Generation loops wrap `generate.call_one().get()` in `try/except`
+    - Generation loops wrap `generate_trajectory.call_one().get()` in `try/except`
     - On failure, the generator logs and retries instead of crashing the loop
     """)
     return
 
 
-# Cell 34: Scaling up
 @app.cell
 def _(mo):
     mo.md(r"""
@@ -1715,10 +1638,11 @@ def _(mo):
 
     | Scale | What Changes |
     |-------|--------------|
-    | More generators | Increase `num_generators` slider -- spawns larger ActorMesh |
-    | More zorplex workers | Increase `NUM_ZORPLEX` -- parallel task generation |
+    | More generators | Increase `num_generators` slider -- spawns larger ActorMesh, `.call()` broadcast scales automatically |
+    | More zorplex workers | Increase `NUM_ZORPLEX` -- parallel task generation via Service |
     | Multi-node | Use `SlurmJob` instead of `this_host()` |
-    | Better algorithms | Swap REINFORCE for PPO/GRPO |
+    | Better algorithms | Swap REINFORCE for PPO/GRPO (add importance sampling) |
+    | Production generators | Wrap generators in a Service too (health tracking, auto-scaling) |
     | More services | Add reward models, search APIs as actors |
 
     **The patterns stay the same:**
@@ -1733,7 +1657,6 @@ def _(mo):
     return
 
 
-# Cell 35: Recap (NB01-07 summary, forward-looking conclusion)
 @app.cell
 def _(mo):
     mo.md(r"""

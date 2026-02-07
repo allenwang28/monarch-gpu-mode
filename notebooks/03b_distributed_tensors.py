@@ -410,7 +410,10 @@ def _(comms, monarch, nn, torch):
 
             train2(model, torch.rand(3, 4), torch.full((3,), 1, dtype=torch.int64))
 
-            simulator.display()
+            try:
+                simulator.display()
+            except Exception:
+                pass
 
     simulate()
     return
