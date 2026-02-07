@@ -1,12 +1,13 @@
 import marimo
 
-__generated_with = "0.19.7"
+__generated_with = "0.19.9"
 app = marimo.App(width="medium")
 
 
 @app.cell
 def _():
     import marimo as mo
+
     return (mo,)
 
 
@@ -15,7 +16,8 @@ def _():
     # Shared imports for the notebook
     import torch
     from monarch.actor import Actor, endpoint, current_rank, this_host
-    return Actor, current_rank, endpoint, this_host, torch
+
+    return (this_host,)
 
 
 @app.cell
@@ -90,7 +92,7 @@ def _(mo):
         └── ...                    │                          │
     ```
 
-    **Key insight:** Allocation is slow, but spawning on existing hosts is fast.
+    **Key insight:** Allocation is slow, but re-creating the HostMesh from existing hosts is fast.
     """)
     return
 
@@ -98,12 +100,11 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    **What you'll learn:**
+    ## DDP with Monarch
 
-    1. The pain of traditional distributed development (sbatch, wait, debug, repeat)
-    2. `this_host()` for local development, Monarch's `Job` for real clusters
-    3. Mesh operations: `.call()`, `.slice()`, `.call_one()`
-    4. How logs and errors are aggregated back to your controller
+    Let's make this concrete. Below is a standard PyTorch DDP training script — no
+    Monarch code at all. We'll use Monarch's `SPMDActor` to launch it, just like
+    `torchrun` would, but from this notebook.
     """)
     return
 
@@ -111,180 +112,43 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## Your First Interactive Session
+    ### The Training Script
 
-    For local development, `this_host()` gives you a host that can spawn multiple
-    processes. On a real cluster, you'd use something like `SlurmJob` to allocate hosts — but the
-    pattern is identical.
-
-    *Note: `"gpus"` in `per_host={"gpus": N}` is a dimension label for the mesh —
-    it doesn't require physical GPUs. You can run these examples on a CPU-only
-    machine.*
-    """)
-    return
-
-
-@app.cell
-def _(Actor, current_rank, endpoint, this_host, torch):
-    class Worker(Actor):
-        """A simple worker that knows its rank."""
-
-        def __init__(self):
-            self.rank = current_rank().rank
-            print(f"Worker initialized on rank {self.rank}")
-
-        @endpoint
-        def compute(self, data: torch.Tensor) -> dict:
-            result = data.sum().item() * (self.rank + 1)
-            return {
-                "rank": self.rank,
-                "input_shape": tuple(data.shape),
-                "result": result,
-            }
-
-    # Spawn 4 worker processes locally
-    host = this_host()
-    procs = host.spawn_procs(per_host={"gpus": 4})
-    workers = procs.spawn("workers", Worker)
-
-    # Call all workers with the same data
-    data = torch.randn(10, 10)
-    results = workers.compute.call(data).get()
-
-    for _point, _result in results.items():
-        print(f"Worker {_result['rank']}: computed {_result['result']:.2f}")
-    return (workers,)
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## Working with Individual Actors
-
-    When you spawn actors on a mesh, you get an ActorMesh.
-    You can slice it to talk to individual actors or subsets.
-    """)
-    return
-
-
-@app.cell
-def _(torch, workers):
-    # Call all workers
-    all_results = workers.compute.call(torch.ones(5, 5)).get()
-    print(f"All workers returned: {list(all_results.values())}")
-
-    # Call just worker 0
-    worker_0 = workers.slice(gpus=0)
-    result_0 = worker_0.compute.call_one(torch.ones(5, 5)).get()
-    print(f"Worker 0 alone: {result_0}")
-
-    # Call workers 1 and 2
-    subset = workers.slice(gpus=slice(1, 3))
-    subset_results = subset.compute.call(torch.ones(5, 5)).get()
-    print(f"Workers 1-2 returned: {list(subset_results.values())}")
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## All Logs in One Place
-
-    When actors print, their output is aggregated back to your controller — no
-    SSH-ing into nodes to check logs.
-    """)
-    return
-
-
-@app.cell
-def _(Actor, current_rank, endpoint, this_host):
-    import time
-
-    class VerboseWorker(Actor):
-        def __init__(self):
-            self.rank = current_rank().rank
-            print(f"[Rank {self.rank}] Initializing...")
-
-        @endpoint
-        def do_work(self, task_id: int) -> str:
-            print(f"[Rank {self.rank}] Starting task {task_id}")
-            time.sleep(0.1 * (self.rank + 1))  # Simulate varying work
-            print(f"[Rank {self.rank}] Completed task {task_id}")
-            return f"rank_{self.rank}_task_{task_id}"
-
-    verbose_procs = this_host().spawn_procs(per_host={"gpus": 3})
-    verbose_workers = verbose_procs.spawn("verbose", VerboseWorker)
-
-    # All workers work on the same task — watch the interleaved logs
-    verbose_results = verbose_workers.do_work.call(42).get()
-    for _point, _result in verbose_results.items():
-        print(f"  {_result}")
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## When Things Go Wrong
-
-    Errors from remote actors are brought back to your controller with full tracebacks.
-    """)
-    return
-
-
-@app.cell
-def _(Actor, current_rank, endpoint, this_host):
-    class FlakyWorker(Actor):
-        def __init__(self):
-            self.rank = current_rank().rank
-
-        @endpoint
-        def risky_operation(self, fail_on_rank: int) -> str:
-            if self.rank == fail_on_rank:
-                raise ValueError(f"Intentional failure on rank {self.rank}!")
-            return f"success on rank {self.rank}"
-
-    flaky_procs = this_host().spawn_procs(per_host={"gpus": 3})
-    flaky_workers = flaky_procs.spawn("flaky", FlakyWorker)
-
-    # This will fail on rank 1
-    try:
-        flaky_results = flaky_workers.risky_operation.call(1).get()
-    except Exception as e:
-        print(f"Caught error: {type(e).__name__}")
-        print(f"Message: {e}")
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## On a Real Cluster
-
-    Everything we just did locally works the same on a SLURM cluster. The only
-    difference is how you get your hosts:
+    This is `train.py` — a vanilla PyTorch DDP script:
 
     ```python
-    from monarch.job import SlurmJob
+    import os
+    import torch
+    import torch.distributed as dist
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.nn.parallel import DistributedDataParallel as DDP
 
-    # Allocate hosts (slow, one time)
-    job = SlurmJob(meshes={"workers": 4}, gpus_per_node=8)
-    host_mesh = job.state().workers
+    def main():
+        dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
 
-    # From here, same pattern as this_host()
-    proc_mesh = host_mesh.spawn_procs(per_host={"gpus": 8})
-    trainers = proc_mesh.spawn("trainer", TrainerActor)
-    trainers.train.call(dataset).get()
+        model = nn.Linear(10, 1).cuda()
+        ddp_model = DDP(model)
 
-    # Iterate without re-allocating
-    proc_mesh_2 = host_mesh.spawn_procs(per_host={"gpus": 8})  # Fast!
+        optimizer = optim.SGD(ddp_model.parameters(), lr=0.01)
+
+        for step in range(5):
+            inputs = torch.randn(4, 10).cuda()
+            outputs = ddp_model(inputs)
+            loss = outputs.sum()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            print(f"[Rank {rank}] Step {step} loss={loss.item()}")
+
+        dist.destroy_process_group()
+
+    if __name__ == "__main__":
+        main()
     ```
-
-    The key insight: `SlurmJob` handles the slow allocation step. Everything after
-    that — `spawn_procs`, `spawn`, `call` — is the same API you just used with
-    `this_host()`.
-
-    TODO - pointer to `monarchrun` to wrap existing SPMD workloads
     """)
     return
 
@@ -292,19 +156,164 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## Summary
+    ### Launching DDP via SPMDActor
 
-    **Key takeaways:**
+    `SPMDActor` sets up the torch elastic environment variables (`RANK`, `LOCAL_RANK`,
+    `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT`) and executes the training script.
+    """)
+    return
 
-    1. **Decouple allocation from iteration**: Allocate hosts once, spawn fast
-    2. **`this_host()`** for local dev, **`SlurmJob`** for clusters — same code
-    3. **Mesh operations**: `.call()` broadcasts, `.slice()` targets, `.call_one()`
-       returns a single value
-    4. **Aggregated everything**: Logs and errors come back to your controller
 
-    We just caught a single failure with try/except. But remember those 419
-    interruptions from Llama 3 training? When failures hit every 3 hours across
-    16,000 GPUs, you need something more systematic. That's next.
+@app.cell
+def _(this_host):
+    import os
+    from monarch.spmd import SPMDActor
+
+    GPUS_PER_HOST = 4
+    TRAIN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train.py")
+
+    # Spawn processes on the local host
+    local_proc_mesh = this_host().spawn_procs(per_host={"gpus": GPUS_PER_HOST})
+
+    # Spawn SPMDActor — it configures torch elastic env vars automatically
+    spmd_actors = local_proc_mesh.spawn("_SPMDActor", SPMDActor)
+
+    # Get master address/port from the first actor
+    first_values = dict.fromkeys(local_proc_mesh._labels, 0)
+    master_addr, master_port = (
+        spmd_actors.slice(**first_values).get_host_port.call_one(None).get()
+    )
+
+    # Execute training script across all processes
+    spmd_actors.main.call(master_addr, master_port, [TRAIN_SCRIPT]).get()
+
+    print("DDP training completed!")
+    return
+
+
+@app.cell
+def _():
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Making SPMD Interactive with `serve()` + `run_spmd()`
+
+    The `SPMDActor` approach above works, but Monarch provides a higher-level API
+    that makes the interactive loop explicit: `serve()` allocates hosts and launches
+    workers once, then `run_spmd()` can be called repeatedly on the same hosts.
+    """)
+    return
+
+
+@app.cell
+def _():
+    import os
+    from monarch.job.spmd import serve
+
+    GPUS_PER_HOST = 4
+    TRAIN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train.py")
+
+    # serve() allocates hosts and launches workers (slow, one time)
+    job = serve(
+        [
+            "torchrun",
+            f"--nproc-per-node={GPUS_PER_HOST}",
+            "--standalone",
+            TRAIN_SCRIPT,
+        ],
+        scheduler="local_cwd",
+    )
+
+    # run_spmd() executes the training script on the reserved hosts
+    job.run_spmd()
+    return (job,)
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ### Iterate Without Reprovisioning
+
+    Edit `train.py`, then call `run_spmd()` again — same hosts, no reallocation:
+    """)
+    return
+
+
+@app.cell
+def _(job):
+    # After editing train.py, just re-run on the same hosts
+    job.run_spmd()
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    You can also reload a cached job from a previous session:
+
+    ```python
+    from monarch.job.spmd import job_load
+
+    job = job_load(".monarch/job_state.pkl")
+    job.run_spmd()  # runs on same reserved hosts
+    ```
+
+    ### Remote Debugging
+
+    Add `breakpoint()` anywhere in your training script, then attach from a
+    separate terminal:
+
+    ```bash
+    $ monarch debug
+    ```
+
+    This opens an interactive pdb session across all ranks.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ### Multi-Node Training with SLURM
+
+    The examples above use `scheduler="local_cwd"` for single-node training. When
+    running on a cluster with a scheduler like SLURM, swap the command list for a
+    `torchx` `AppDef` — the same `serve()` + `run_spmd()` pattern applies:
+
+    ```python
+    from torchx import specs
+    from monarch.job.spmd import serve
+
+    app = specs.AppDef(
+        name="multi-node-training",
+        roles=[
+            specs.Role(
+                name="trainer",
+                image="\",
+                entrypoint="torchrun",
+                args=[
+                    "--nnodes=2",
+                    "--nproc-per-node=8",
+                    "--rdzv-backend=c10d",
+                    "--rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT",
+                    TRAIN_SCRIPT,
+                ],
+                num_replicas=2,
+                resource=specs.Resource(cpu=32, gpu=8, memMB=256000),
+            ),
+        ],
+    )
+
+    job = serve(app, scheduler="slurm", scheduler_cfg={"partition": "gpu"})
+    job.run_spmd()
+
+    # Edit train.py, then re-run without reprovisioning:
+    job.run_spmd()
+    ```
     """)
     return
 
