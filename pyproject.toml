@@ -13,6 +13,7 @@ dependencies = [
     "accelerate",
     "matplotlib>=3.10.8",
     "scipy>=1.15.3",
+    "torchshow>=0.5.2",
 ]
 
 [project.optional-dependencies]
