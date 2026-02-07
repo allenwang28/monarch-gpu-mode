@@ -385,6 +385,16 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
+    For more details on error handling in Monarch, see the
+    [Error Handling in Meshes](https://meta-pytorch.org/monarch/actors.html#error-handling-in-meshes)
+    documentation.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
     ## Summary
 
     **Key takeaways:**
