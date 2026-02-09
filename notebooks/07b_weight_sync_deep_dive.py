@@ -610,7 +610,7 @@ def _(mo):
     Fabric Adapter, used on AWS) is a relevant transport but not yet supported — it's
     actively being worked on.
 
-    The main notebook (06) covers the high-level patterns for async RL weight sync —
+    The main notebook (07) covers the high-level patterns for async RL weight sync —
     magic pointers, CPU staging, circular buffers, and DTensor re-sharding. This notebook
     showed the RDMA specifics underneath: what the NIC is actually doing and how to avoid
     paying unnecessary costs on the hot path.

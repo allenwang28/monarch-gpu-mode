@@ -191,7 +191,7 @@ cat > "$OUTPUT_DIR/index.html" << 'INDEXEOF'
     </li>
     <li>
       <a href="07b_weight_sync_deep_dive.html">
-        <span class="nb-num">07b</span> Weight Sync Deep Dive
+        <span class="nb-num">07b</span> RDMA Deep Dive
         <span class="nb-desc">ibverbs internals, memory registration benchmarks, and full implementations.</span>
       </a>
     </li>

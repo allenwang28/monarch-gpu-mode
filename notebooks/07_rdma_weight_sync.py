@@ -139,11 +139,11 @@ def _(mo):
     The bottleneck is the cross-node RDMA link at 50 GB/s per NIC. But modern nodes
     have **8 NICs** (one per GPU), so aggregate cross-node bandwidth is 400 GB/s.
 
-    Here's how all these interconnects fit together in a full node:
+    Here's how all these interconnects fit together across two nodes:
 
     ```
     ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-    │                                              NODE A                                                      │
+    │                                              NODE B                                                      │
     │                                                                                                          │
     │    ┌───────────────────────────────────────────────────────────────────────────────────────────────┐     │
     │    │                              NVSwitch / NVLink Fabric                                         │     │
@@ -192,7 +192,7 @@ def _(mo):
     │    │  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘ └──────┘ └──────┘ └──────┘                      │     │
     │    │                              NVSwitch / NVLink Fabric                                         │     │
     │    └───────────────────────────────────────────────────────────────────────────────────────────────┘     │
-    │                                              NODE B                                                      │
+    │                                              NODE A                                                      │
     └──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
     Bandwidth encoding (line intensity):
@@ -450,12 +450,15 @@ def _(mo):
 
     The trainer doesn't even know when generators pull weights. True one-sided.
 
-    ### RDMABuffer in Action
+    ### RDMABuffer in Action: Pull Model (`read_into`)
+
+    The **pull** model is the natural fit for async RL: each generator decides *when* it
+    needs fresh weights, then reads them directly from the trainer's registered memory.
 
     ```python
     from monarch.rdma import RDMABuffer
 
-    # Trainer side: register weights
+    # Trainer side: register weights once
     weights = torch.randn(1024, 1024, device="cuda")
     buffer = RDMABuffer(weights.view(torch.uint8).flatten())
 
@@ -468,16 +471,28 @@ def _(mo):
     handle = trainer.get_weight_handle.call_one().get()  # Tiny message
     gpu_weights = model.weights.view(torch.uint8).flatten()
     handle.read_into(gpu_weights).get()                   # Bulk RDMA transfer
-
-    # Push model: caller writes local src_tensor into the remote RDMABuffer
-    buffer.write_from(src_tensor).get()
     ```
 
-    **Pull vs Push**: `read_into` is the **pull** model (generator reads remote data into
-    its local buffer), while `write_from` is the **push** model (caller writes local data
-    into the remote buffer). Both are one-sided RDMA operations — the remote side is not
-    involved. In async RL, pull is more natural because each generator decides *when* it
-    needs fresh weights.
+    The trainer is not involved in the transfer at all — `read_into` is a one-sided
+    RDMA read initiated entirely by the generator.
+
+    ### RDMABuffer in Action: Push Model (`write_from`)
+
+    The **push** model is the reverse: the caller writes its local data *into* the
+    remote `RDMABuffer`. This is useful when the trainer wants to proactively push
+    weights to a known destination.
+
+    ```python
+    # Generator side: register a receive buffer and share the handle
+    recv_buffer = RDMABuffer(local_weights.view(torch.uint8).flatten())
+
+    # Trainer side: push weights into the generator's buffer
+    recv_buffer.write_from(trainer_weights.view(torch.uint8).flatten()).get()
+    ```
+
+    Both `read_into` and `write_from` are one-sided RDMA operations — the remote
+    side is not involved. In async RL, pull is more common because each generator
+    decides *when* it needs fresh weights.
 
     **Want to understand how RDMA works under the hood?** Check out **07b_weight_sync_deep_dive.py**
     for ibverbs internals, queue pair setup, and why Monarch's actor model is such a natural fit
@@ -1253,7 +1268,9 @@ def _(mo):
 
     All 5 actors run **concurrently and independently**. The trainer never waits for generators,
     and each generator grabs weights whenever it's ready (at slightly different rates to show
-    the async behavior). To verify correctness, we set weights to `version` and check on read.
+    the async behavior). To verify correctness, we fill each weight tensor with the version
+    number — so when a generator reads the tensor, it can check the values to confirm it
+    actually received the right data over RDMA.
 
     **Race condition safety**: The circular buffer's slot count is tuned so that
     `buffer_size × update_interval >> sync_time`. This ensures a slot isn't overwritten
@@ -1440,8 +1457,8 @@ def _(mo):
 
     | Scenario | Solution |
     |----------|----------|
-    | Learning RDMA patterns | This notebook + 06b |
-    | Custom RL weight sync | See 06b for `RDMABuffer` + `RDMAAction` patterns |
+    | Learning RDMA patterns | This notebook + 07b |
+    | Custom RL weight sync | See 07b for `RDMABuffer` + `RDMAAction` patterns |
     | General tensor storage | Use TorchStore |
     | Checkpointing | Use TorchStore's `put_state_dict` |
     """)
@@ -1470,8 +1487,9 @@ def _(mo):
     5. **Circular buffers**: Version weights without memory churn
        - Pre-register RDMA buffers, reuse slots
 
-    6. **Weight re-sharding**: Different layouts need overlap computation
-       - Routed approach avoids redundant transfers
+    6. **Weight re-sharding**: Trainer and generator may shard tensors differently
+       (e.g., row-sharded vs column-sharded), so we pre-compute which chunks of each
+       sender shard overlap with each receiver shard and only transfer those
 
     ### Want More?
 
